@@ -1,0 +1,6 @@
+{
+  "_comment": "Synthetic workflow parameters for --start-run without --confirm-submit. The bucket does not exist; replace every value before submitting a real run.",
+  "input": "s3://clawbio-demo-bucket/samplesheets/demo_samplesheet.csv",
+  "genome": "GRCh38",
+  "aligner": "star_salmon"
+}

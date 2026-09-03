@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
   "generated_by": "scripts/generate_catalog.py",
-  "skill_count": 97,
+  "skill_count": 98,
   "galaxy_tool_count": 8182,
   "skills": [
     {
@@ -2293,6 +2293,50 @@
         "profile-report",
         "gwas-lookup"
       ],
+      "license": "MIT",
+      "model_license": "",
+      "data_license": ""
+    },
+    {
+      "name": "healthomics-bridge",
+      "cli_alias": null,
+      "description": "Submit, monitor and import AWS HealthOmics genomics runs through the boto3 API directly, behind an allow-listed client, a fail-closed data-egress gate and an estimate-first cost gate.",
+      "version": "0.1.0",
+      "status": "planned",
+      "maturity_tier": "tested",
+      "maturity_evidence": {
+        "has_skill_md": true,
+        "has_script": true,
+        "has_tests": true,
+        "has_demo": true,
+        "cli_registered": false,
+        "ci_tested": false,
+        "benchmark_validated": false
+      },
+      "has_script": true,
+      "has_tests": true,
+      "has_demo": true,
+      "demo_command": "python skills/healthomics-bridge/healthomics_bridge.py --demo",
+      "dependencies": [
+        "python>=3.11",
+        "boto3>=1.34"
+      ],
+      "tags": [
+        "aws",
+        "healthomics",
+        "cloud",
+        "boto3",
+        "workflow-execution",
+        "provenance"
+      ],
+      "trigger_keywords": [
+        "AWS HealthOmics",
+        "HealthOmics run",
+        "submit Ready2Run workflow",
+        "omics run status",
+        "start genomics workflow on AWS"
+      ],
+      "chaining_partners": [],
       "license": "MIT",
       "model_license": "",
       "data_license": ""

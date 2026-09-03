@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+"""healthomics-bridge — submit, monitor and import AWS HealthOmics runs via boto3.
+
+Talks to the HealthOmics API directly, behind an allow-listed client, a
+fail-closed egress gate and a cost gate on submission. The allowlist is the
+point: boto3 exposes all 107 ``omics`` operations, and an agent handed that
+surface can delete a run, cancel in-flight work, or mutate shared account
+configuration as easily as it can list runs. Seven operations are reachable
+here; destruction and shared-config mutation are barred by name and no flag
+unlocks them.
+
+Two things the raw SDK does not do for you, which this skill does:
+
+* **Show the request before it costs anything.** ``--start-run`` builds the
+  exact ``StartRun`` payload, prices it where AWS publishes a flat fee, and
+  submits only behind a second explicit confirmation.
+* **Derive the idempotency token.** ``StartRun`` requires ``requestId`` and AWS
+  deduplicates submissions that reuse one. Deriving it from the request's own
+  content means an accidentally repeated command is a no-op rather than a
+  second charge.
+
+What it deliberately does NOT do: run-performance analysis, costed timelines,
+workflow linting, container reachability. Those are not API calls — they are
+AWS's own tooling (``amazon-omics-tools``, the Run Analyzer) — and this skill
+reports what a run did rather than judging how well it did it.
+
+Offline demo (no AWS account, no credentials, no network, no boto3 needed):
+
+    uv run python skills/healthomics-bridge/healthomics_bridge.py --demo --output /tmp/ho
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from clawbio.common.checksums import sha256_file  # noqa: E402
+from clawbio.common.report import (  # noqa: E402
+    generate_report_footer,
+    generate_report_header,
+    write_result_json,
+)
+from clawbio.common.textio import write_text_lf  # noqa: E402
+from healthomics_pricing import estimated_cost_line  # noqa: E402
+from omics_client import (  # noqa: E402
+    ALLOWED_OPERATIONS,
+    PERMANENTLY_EXCLUDED,
+    OmicsCallError,
+    OmicsClient,
+    OperationNotAllowed,
+    build_boto_client,
+)
+
+SKILL_NAME = "healthomics-bridge"
+SKILL_VERSION = "0.1.0"
+
+_SKILL_DIR = Path(__file__).resolve().parent
+_REL_SCRIPT = Path("skills") / _SKILL_DIR.name / Path(__file__).name
+_DEMO_BUNDLE = _SKILL_DIR / "tests" / "fixtures" / "demo_run_bundle.json"
+
+DISCLAIMER_MARKER = "not a medical device"
+
+_TASK_FIELDS = ["taskId", "name", "status", "cpus", "memory", "startTime", "stopTime"]
+_MAX_TASKS_TO_ENRICH = 25
+
+
+class EgressRefused(RuntimeError):
+    """A submission was attempted without acknowledging that data leaves the machine."""
+
+
+class OmicsOperations:
+    """Allow-listed wrapper over a boto3 omics client.
+
+    The allowlist is checked BEFORE dispatch, so a refused operation never
+    reaches AWS even when the underlying client is live.
+    """
+
+    def __init__(self, *, _boto: Any) -> None:
+        self._boto = _boto
+
+    def call(self, operation: str, **kwargs: Any) -> dict[str, Any]:
+        if operation not in ALLOWED_OPERATIONS:
+            reason = PERMANENTLY_EXCLUDED.get(operation)
+            if reason:
+                raise OperationNotAllowed(f"{operation} is refused: {reason}.")
+            raise OperationNotAllowed(
+                f"{operation} is not in this skill's allowlist. healthomics-bridge "
+                f"may call only: {', '.join(sorted(ALLOWED_OPERATIONS))}."
+            )
+        # botocore exposes operations as snake_case methods; the allowlist is
+        # kept in the API's own PascalCase so it reads the same as AWS's docs.
+        method = "".join(
+            "_" + c.lower() if c.isupper() else c for c in operation
+        ).lstrip("_")
+        return getattr(self._boto, method)(**kwargs)
+
+
+def collect_remote_paths(params: dict[str, Any], output_uri: str | None) -> list[str]:
+    """Every URI in the submission that would move data off this machine."""
+    remote: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str) and "://" in value:
+            remote.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+
+    walk({k: v for k, v in params.items() if not str(k).startswith("_")})
+    if output_uri:
+        remote.append(output_uri)
+    return sorted(set(remote))
+
+
+def check_remote_inputs(
+    params: dict[str, Any], output_uri: str | None, acknowledged: bool
+) -> None:
+    """Fail closed unless the caller has acknowledged data egress.
+
+    Mirrors the nf-core wrappers' --allow-remote-inputs contract: the gate
+    records an acknowledgement, not a data location.
+    """
+    remote = collect_remote_paths(params, output_uri)
+    if not remote:
+        return
+    if not acknowledged:
+        raise EgressRefused(
+            "This submission reads or writes paths outside this machine:\n  "
+            + "\n  ".join(remote)
+            + "\nRe-run with --allow-remote-inputs to acknowledge that genomic "
+            "data will be handled by AWS HealthOmics."
+        )
+    print(
+        f"WARNING: --allow-remote-inputs is set; {len(remote)} path(s) will be read "
+        "or written by AWS HealthOmics, so genomic data leaves the local machine: "
+        + ", ".join(remote),
+        file=sys.stderr,
+    )
+
+
+def derive_request_id(
+    *,
+    workflow_id: str,
+    workflow_type: str,
+    params: dict[str, Any],
+    output_uri: str,
+    role_arn: str,
+    run_name: str,
+) -> str:
+    """A stable idempotency token derived from the submission itself.
+
+    ``StartRun`` requires ``requestId``; AWS deduplicates submissions that
+    reuse one. Deriving the token from the request's own content means
+    re-running the identical command is a no-op at AWS rather than a second
+    billable run — and changing any part of the submission correctly yields a
+    new token, so a genuine resubmission is never suppressed.
+    """
+    payload = json.dumps(
+        {
+            "workflow_id": workflow_id,
+            "workflow_type": workflow_type,
+            "params": params,
+            "output_uri": output_uri,
+            "role_arn": role_arn,
+            "run_name": run_name,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def build_start_run_request(
+    *,
+    workflow_id: str,
+    workflow_type: str,
+    params: dict[str, Any],
+    output_uri: str,
+    role_arn: str,
+    run_name: str,
+    request_id: str,
+    storage_type: str | None = None,
+    storage_capacity: int | None = None,
+    cache_id: str | None = None,
+    cache_behavior: str | None = None,
+    run_group_id: str | None = None,
+    workflow_version_name: str | None = None,
+    tags: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Assemble the exact StartRun payload, so it can be shown before it is sent.
+
+    Keys are AWS's own camelCase field names, used directly — there is no
+    translation layer, so a casing mismatch between this skill and the API
+    cannot arise. Optional fields are omitted when unset so the
+    API's own defaults apply (notably ``storageType``, which defaults to the
+    preferred DYNAMIC).
+    """
+    request: dict[str, Any] = {
+        "workflowId": workflow_id,
+        "workflowType": workflow_type,
+        "roleArn": role_arn,
+        "name": run_name,
+        "outputUri": output_uri,
+        "parameters": {k: v for k, v in params.items() if not str(k).startswith("_")},
+        "requestId": request_id,
+    }
+    optional = {
+        "storageType": storage_type,
+        "storageCapacity": storage_capacity,
+        "cacheId": cache_id,
+        "cacheBehavior": cache_behavior,
+        "runGroupId": run_group_id,
+        "workflowVersionName": workflow_version_name,
+        "tags": tags,
+    }
+    request.update({k: v for k, v in optional.items() if v is not None})
+    return request
+
+
+_API_PAGE_MAX = 100  # AWS caps maxResults at 100 on ListRuns and ListWorkflows.
+
+
+def list_all(
+    *, client: OmicsClient, operation: str, limit: int, **filters: Any
+) -> list[dict[str, Any]]:
+    """Page through a listing until ``limit`` items or the results run out.
+
+    AWS caps ``maxResults`` at 100 and returns a ``nextToken``. Sending
+    ``maxResults=150`` does not fail — it silently returns 100, which is a
+    wrong answer delivered confidently. Requesting more than the cap is also
+    just rude to the API, so each page asks for at most what AWS allows.
+    """
+    items: list[dict[str, Any]] = []
+    token: str | None = None
+    while len(items) < limit:
+        kwargs = dict(filters)
+        kwargs["maxResults"] = min(_API_PAGE_MAX, limit - len(items))
+        if token:
+            kwargs["startingToken"] = token
+        response = client.call(operation, **kwargs)
+        page = list(response.get("items", []))
+        items.extend(page)
+        token = response.get("nextToken")
+        if not token or not page:
+            break
+    return items[:limit]
+
+
+_TERMINAL_RUN_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED", "DELETED"})
+
+
+def wait_for_run(
+    *, client: OmicsClient, run_id: str, poll_seconds: float = 30.0,
+    timeout_seconds: float = 86_400.0,
+) -> dict[str, Any]:
+    """Poll ``GetRun`` until the run reaches a terminal state.
+
+    Watching a run you started is not analysis, so it belongs here rather than
+    a separate tool. Uses only ``GetRun``, already allow-listed, so this adds
+    no reach — a caller who can start a run can already read its status.
+
+    Raises ``TimeoutError`` rather than polling forever: an unbounded loop
+    against a billing API is how a stuck run becomes a stuck terminal.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        run = client.call("GetRun", id=str(run_id))
+        status = str(run.get("status", "")).upper()
+        if status in _TERMINAL_RUN_STATES:
+            return run
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Run {run_id} was {status or 'UNKNOWN'} after {timeout_seconds:.0f}s. "
+                f"It is still running and still billing — this gave up watching, "
+                f"it did not stop the run."
+            )
+        time.sleep(poll_seconds)
+
+
+def normalise_storage_capacity(requested: int, *, announce: bool = False) -> int:
+    """Round a STATIC capacity up to what AWS will actually allocate and bill.
+
+    The rule is 1,200 GiB **or a multiple of 2,400 GiB** — not 1,200 chunks,
+    which is the intuitive-but-wrong reading. AWS's own worked examples:
+    5,000 rounds to 7,200 and 42,000 rounds to 43,200.
+
+    Rounding rather than refusing, because AWS rounds anyway; the value this
+    adds is telling the user before the invoice does.
+    """
+    if requested <= 1_200:
+        allocated = 1_200
+    else:
+        allocated = 2_400 * math.ceil(requested / 2_400)
+    if announce and allocated != requested:
+        print(
+            f"NOTE: --storage-capacity {requested} GiB is not an allocatable size. "
+            f"AWS allocates and bills STATIC storage as 1,200 GiB or a multiple of "
+            f"2,400 GiB, so this run will use {allocated} GiB.",
+            file=sys.stderr,
+        )
+    return allocated
+
+
+def fetch_run_bundle(*, client: OmicsClient, run_id: str) -> dict[str, Any]:
+    """Everything one run report needs, in as few calls as possible.
+
+    Still one workflow lookup, with no try-PRIVATE-then-retry-READY2RUN dance —
+    but not because the id self-resolves. ``GetWorkflow`` raises
+    ``ResourceNotFoundException`` for a Ready2Run id unless told
+    ``type=READY2RUN``; the run record carries ``workflowType``, so the type is
+    already known before the call, and no try-one-then-the-other retry is
+    needed.
+    """
+    run = client.call("GetRun", id=str(run_id))
+    tasks_response = client.call("ListRunTasks", id=str(run_id))
+    tasks = list(tasks_response.get("items", []))
+
+    workflow: dict[str, Any] = {}
+    workflow_id = run.get("workflowId")
+    if workflow_id:
+        lookup: dict[str, Any] = {"id": str(workflow_id)}
+        # Omitted rather than guessed when the run does not say: AWS's own
+        # default is the right answer, and a wrong guess is a not-found error
+        # that reads like a bad id.
+        workflow_type = run.get("workflowType")
+        if workflow_type:
+            lookup["type"] = workflow_type
+        try:
+            workflow = client.call("GetWorkflow", **lookup)
+        except Exception:
+            # A workflow this account can no longer see does not invalidate the
+            # run report; it just means the workflow block stays empty. This
+            # once also hid a real bug — the lookup failing for every Ready2Run
+            # run — so the report names the workflow as unavailable rather than
+            # quietly omitting it.
+            workflow = {}
+
+    # Tags are read back, not echoed from the submission. Setting run tags is
+    # this skill's headline capability and it could not confirm its own work --
+    # verifying required the AWS CLI. Read-only and best-effort: a missing
+    # ListTagsForResource permission must not sink an otherwise good report.
+    tags: dict[str, str] = {}
+    arn = run.get("arn")
+    if arn:
+        try:
+            tags = dict(client.call("ListTagsForResource", resourceArn=str(arn)).get("tags", {}))
+        except Exception:
+            tags = {}
+
+    return {"run": run, "workflow": workflow, "tasks": tasks, "tags": tags}
+
+
+def submit_run(
+    *, client: OmicsClient, request: dict[str, Any], confirmed: bool
+) -> dict[str, Any]:
+    """Submit a run, but only past the cost gate.
+
+    Without ``confirmed`` this returns the request untouched and calls nothing
+    — the estimate-first contract, and the reason an
+    unconfirmed --start-run bills nothing.
+    """
+    if not confirmed:
+        return {"submitted": False, "request": request, "response": {}}
+    response = client.call("StartRun", **request)
+    return {"submitted": True, "request": request, "response": response}
+
+
+def map_run_report(
+    bundle: dict[str, Any],
+    *,
+    region: str,
+    start_run_request: dict[str, Any] | None = None,
+    submitted: bool = False,
+    demo: bool = False,
+) -> dict[str, Any]:
+    """Turn API payloads into this skill's own reported shape."""
+    run = bundle.get("run") or {}
+    workflow = bundle.get("workflow") or {}
+    tasks = list(bundle.get("tasks") or [])
+
+    failed = [t for t in tasks if str(t.get("status", "")).upper() in {"FAILED", "CANCELLED"}]
+    completed = [t for t in tasks if str(t.get("status", "")).upper() == "COMPLETED"]
+
+    return {
+        "mode": "run",
+        "region": region,
+        "transport": "boto3",
+        "run": run,
+        "workflow": workflow,
+        "tasks": tasks,
+        "tags": dict(bundle.get("tags") or {}),
+        "n_tasks": len(tasks),
+        "n_completed": len(completed),
+        "n_failed": len(failed),
+        "run_status": run.get("status", "UNKNOWN"),
+        "submitted": submitted,
+        "start_run_request": start_run_request,
+        "demo": demo,
+    }
+
+
+def map_list_report(
+    items: list[dict[str, Any]], *, kind: str, region: str, demo: bool = False
+) -> dict[str, Any]:
+    """Turn a --list-runs / --list-workflows result into the reported shape."""
+    return {
+        "mode": kind,
+        "region": region,
+        "transport": "boto3",
+        "items": items,
+        "n_items": len(items),
+        "run": {}, "workflow": {}, "tasks": [], "tags": {}, "run_status": "N/A",
+        "n_tasks": 0, "n_completed": 0, "n_failed": 0,
+        "submitted": False, "start_run_request": None, "demo": demo,
+    }
+
+
+def _provenance_lines(data: dict[str, Any]) -> list[str]:
+    """The honest ceiling for work that happened in someone else's account."""
+    if data["demo"]:
+        ceiling = (
+            "This report replays a synthetic fixture. No AWS call was made, and "
+            "nothing here describes an actual account, run or workflow."
+        )
+    elif data.get("mode") != "run" or not data["run"].get("id"):
+        ceiling = (
+            "No AWS HealthOmics run executed as part of this report. Any "
+            "identifiers above describe an unsent request or a query result, "
+            "not a run that took place."
+        )
+    else:
+        ceiling = (
+            "This run executed in AWS HealthOmics. Replaying it requires the same "
+            "account, execution role and container images. The identifiers here "
+            "pin what the run WAS; no checksum in this bundle covers the run's "
+            "outputs, which remain in S3 — this skill holds no S3 credentials."
+        )
+    return [
+        "- Transport: **boto3** (AWS HealthOmics API directly).",
+        f"- Allow-listed operations: {len(ALLOWED_OPERATIONS)} of 107 available.",
+        "",
+        ceiling,
+    ]
+
+
+def _report_markdown(data: dict[str, Any]) -> str:
+    if data.get("mode") in {"runs", "workflows"}:
+        return _list_markdown(data)
+
+    run = data["run"]
+    workflow = data["workflow"]
+    header = generate_report_header(
+        title="AWS HealthOmics Run Report",
+        skill_name=SKILL_NAME,
+        skill_version=SKILL_VERSION,
+        extra_metadata={
+            "Mode": "Synthetic offline demo" if data["demo"] else "Live AWS HealthOmics (boto3)",
+            "Region": data["region"],
+            "Run status": str(data["run_status"]),
+        },
+    )
+    lines = [header, "", "## Run", ""]
+    lines += [
+        f"- **Run id**: `{run.get('id', 'n/a')}`",
+        f"- **Run name**: {run.get('name', 'n/a')}",
+        f"- **Status**: **{data['run_status']}**",
+        f"- **Workflow**: `{workflow.get('name', 'n/a')}` "
+        f"(`{workflow.get('id', run.get('workflowId', 'n/a'))}`, "
+        f"{workflow.get('type', run.get('workflowType', 'n/a'))})",
+        f"- **Output URI**: `{run.get('outputUri', 'n/a')}`",
+    ]
+    if data.get("tags"):
+        rendered = ", ".join(f"`{k}={v}`" for k, v in sorted(data["tags"].items()))
+        lines.append(f"- **Tags**: {rendered}")
+    # Read back rather than echoed: this is what AWS holds, which is the only
+    # way to confirm the tags this skill set actually landed.
+    if run.get("statusMessage"):
+        lines.append(f"- **Status message**: {run['statusMessage']}")
+
+    lines += ["", "## Tasks", ""]
+    lines.append(
+        f"{data['n_tasks']} task(s): {data['n_completed']} completed, {data['n_failed']} failed."
+    )
+    if data["n_failed"]:
+        lines += ["", "### Failed tasks", ""]
+        for task in data["tasks"]:
+            if str(task.get("status", "")).upper() not in {"FAILED", "CANCELLED"}:
+                continue
+            lines.append(
+                f"- **{task.get('name', task.get('taskId', 'unknown'))}** "
+                f"(`{task.get('taskId', 'n/a')}`) — {task.get('status')}"
+            )
+            # The reason is the whole point of reading this section. AWS puts
+            # it on the task, and omitting it sent users to the console for the
+            # one fact they came for.
+            reason = task.get("statusMessage") or task.get("failureReason")
+            if reason:
+                lines.append(f"  - {reason}")
+
+    if data.get("start_run_request") is not None:
+        lines += ["", "## Submission", ""]
+        verb = "Submitted" if data["submitted"] else "NOT submitted (estimate only)"
+        lines.append(f"**{verb}.** The exact request:")
+        lines += ["", "```json", json.dumps(data["start_run_request"], indent=2), "```"]
+        cost = estimated_cost_line(str(data["start_run_request"].get("workflowId", "")))
+        if cost and data["start_run_request"].get("workflowType") == "READY2RUN":
+            lines += ["", f"**Estimated cost**: {cost}"]
+        if not data["submitted"]:
+            lines.append(
+                "\nNo run was started and nothing was billed. Re-run with "
+                "`--confirm-submit` to submit this request."
+            )
+
+    output_uri = run.get("outputUri")
+    if output_uri:
+        # HealthOmics writes each run under <outputUri>/<runId>/. Pointing the
+        # command at <outputUri> alone pulls every run this account ever wrote
+        # into one directory -- and this is the line users copy verbatim.
+        run_id = str(run.get("id", "")).strip()
+        prefix = f"{output_uri.rstrip('/')}/{run_id}/" if run_id else output_uri
+        lines += [
+            "", "## Fetching the outputs", "",
+            "Outputs stay in S3; this skill holds no S3 credentials. Download "
+            "them with `aws-s3-bridge`, or directly:",
+            "", "```bash",
+            f"aws s3 cp --recursive {prefix} ./run-{run_id or 'outputs'}/",
+            "```",
+        ]
+
+    lines += ["", "## Provenance", ""] + _provenance_lines(data)
+    lines += ["", generate_report_footer().strip(), ""]
+    return "\n".join(lines)
+
+
+def _list_markdown(data: dict[str, Any]) -> str:
+    title = "AWS HealthOmics Runs" if data["mode"] == "runs" else "AWS HealthOmics Workflows"
+    header = generate_report_header(
+        title=title,
+        skill_name=SKILL_NAME,
+        skill_version=SKILL_VERSION,
+        extra_metadata={
+            "Mode": "Synthetic offline demo" if data["demo"] else "Live AWS HealthOmics (boto3)",
+            "Region": data["region"],
+        },
+    )
+    lines = [header, "", f"## {title}", "", f"{data['n_items']} item(s).", ""]
+    lines += ["| Id | Name | Status | Type |", "|---|---|---|---|"]
+    for item in data["items"]:
+        lines.append(
+            f"| `{item.get('id', 'n/a')}` | {item.get('name', 'n/a')} | "
+            f"{item.get('status', 'n/a')} | "
+            f"{item.get('type', item.get('workflowType', 'n/a'))} |"
+        )
+    lines += ["", "## Provenance", ""] + _provenance_lines(data)
+    lines += ["", generate_report_footer().strip(), ""]
+    return "\n".join(lines)
+
+
+# Per-entity table columns. A listing and a run report describe different
+# things, so they get different tables rather than one shape pretending to fit
+# both -- see _write_table.
+_RUN_FIELDS = ("id", "name", "status", "workflowId", "creationTime", "stopTime")
+_WORKFLOW_FIELDS = ("id", "name", "status", "type", "creationTime")
+
+
+def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({f: row.get(f, "") for f in fields})
+    return path
+
+
+def _write_tasks_csv(output_dir: Path, tasks: list[dict[str, Any]]) -> Path:
+    return _write_csv(output_dir / "tables" / "tasks.csv", _TASK_FIELDS, tasks)
+
+
+def _write_table(output_dir: Path, data: dict[str, Any]) -> Path:
+    """Write the table for whatever this report is actually about.
+
+    A --list-workflows bundle used to carry an empty tasks.csv: run-task headers
+    over zero rows, while the workflows it had just fetched appeared only in
+    report.md. That is worse than omitting the file, because a downstream reader
+    sees a well-formed header and concludes the query returned nothing.
+    """
+    mode = data.get("mode")
+    if mode == "runs":
+        return _write_csv(output_dir / "tables" / "runs.csv", _RUN_FIELDS, data["items"])
+    if mode == "workflows":
+        return _write_csv(
+            output_dir / "tables" / "workflows.csv", _WORKFLOW_FIELDS, data["items"]
+        )
+    return _write_tasks_csv(output_dir, data["tasks"])
+
+
+def _warn_before_overwrite(output_dir: Path) -> None:
+    if output_dir.exists() and any(output_dir.iterdir()):
+        print(
+            f"WARNING: {output_dir} already exists and is not empty; files may be overwritten.",
+            file=sys.stderr,
+        )
+
+
+def write_bundle(
+    output_dir: Path, data: dict[str, Any], *, warn_before_overwrite: bool = True
+) -> dict[str, Any]:
+    """Write the full ClawBio output contract."""
+    from clawbio.common.reproducibility import (
+        ReproCommand,
+        ReproPath,
+        write_checksums,
+        write_environment_yml,
+        write_portable_commands_sh,
+    )
+
+    if warn_before_overwrite:
+        _warn_before_overwrite(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    report_path = output_dir / "report.md"
+    write_text_lf(report_path, _report_markdown(data))
+
+    mode = data.get("mode")
+    table_path = _write_table(output_dir, data)
+    if mode in {"runs", "workflows"}:
+        args: list[Any] = ["--list-runs" if mode == "runs" else "--list-workflows"]
+    else:
+        args = ["--run-status", str(data["run"].get("id", ""))]
+    if data["demo"]:
+        args = ["--demo"]
+    args += ["--output", ReproPath(output_dir, anchor="output_dir")]
+
+    commands_path = write_portable_commands_sh(
+        output_dir,
+        ReproCommand(
+            script_path=_REL_SCRIPT,
+            args=args,
+            comment=(
+                "Replays the local reporting step. A live replay additionally requires "
+                "the same AWS account and execution role."
+            ),
+        ),
+        repo_root=_PROJECT_ROOT,
+    )
+    env_path = write_environment_yml(
+        output_dir,
+        env_name="clawbio-healthomics-bridge",
+        pip_deps=["boto3>=1.34"],
+        conda_deps=[],
+        python_version="3.11",
+    )
+
+    if mode in {"runs", "workflows"}:
+        summary = {
+            "kind": mode, "n_items": data["n_items"],
+            "region": data["region"], "demo": data["demo"],
+        }
+        status = "LISTED"
+    else:
+        summary = {
+            "run_id": data["run"].get("id"),
+            "run_status": data["run_status"],
+            "n_tasks": data["n_tasks"],
+            "n_failed_tasks": data["n_failed"],
+            "submitted": data["submitted"],
+            "region": data["region"],
+            "demo": data["demo"],
+        }
+        status = str(data["run_status"])
+
+    result_path = write_result_json(
+        output_dir=output_dir,
+        skill=SKILL_NAME,
+        version=SKILL_VERSION,
+        summary=summary,
+        data=data,
+        datasets={"AWS HealthOmics": "synthetic offline fixture" if data["demo"] else "live account"},
+        status=status,
+        # Exit 0 means the skill produced a truthful report, not that the run
+        # succeeded. The run's outcome is in `status`.
+        ok=True,
+    )
+    write_checksums(
+        [report_path, result_path, table_path, commands_path, env_path],
+        output_dir,
+        anchor=output_dir,
+    )
+    return json.loads(Path(result_path).read_text(encoding="utf-8"))
+
+
+def run_demo(output_dir: Path) -> dict[str, Any]:
+    """Deterministic offline demo: no AWS account, no credentials, no boto3."""
+    bundle = json.loads(_DEMO_BUNDLE.read_text(encoding="utf-8"))
+    data = map_run_report(bundle, region="us-east-1", demo=True)
+    return write_bundle(output_dir, data)
+
+
+def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+    _warn_before_overwrite(output_dir)
+
+    start_run_request: dict[str, Any] | None = None
+    if args.start_run:
+        params = json.loads(Path(args.params).read_text(encoding="utf-8"))
+        check_remote_inputs(params, args.output_uri, args.allow_remote_inputs)
+        request_id = derive_request_id(
+            workflow_id=args.start_run, workflow_type=args.workflow_type,
+            params=params, output_uri=args.output_uri,
+            role_arn=args.role_arn, run_name=args.run_name,
+        )
+        start_run_request = build_start_run_request(
+            workflow_id=args.start_run, workflow_type=args.workflow_type,
+            params=params, output_uri=args.output_uri, role_arn=args.role_arn,
+            run_name=args.run_name, request_id=request_id,
+            storage_type=args.storage_type,
+            storage_capacity=(
+                normalise_storage_capacity(args.storage_capacity, announce=True)
+                if args.storage_capacity else None
+            ),
+            cache_id=args.cache_id, cache_behavior=args.cache_behavior,
+            run_group_id=args.run_group_id,
+            workflow_version_name=args.workflow_version_name,
+            tags=json.loads(args.run_tags) if args.run_tags else None,
+        )
+        if not args.confirm_submit:
+            print(
+                "ESTIMATE ONLY: no run was submitted and nothing was billed. "
+                "Re-run with --confirm-submit to start this run.",
+                file=sys.stderr,
+            )
+            data = map_run_report(
+                {"run": {}, "workflow": {}, "tasks": []}, region=args.region,
+                start_run_request=start_run_request, submitted=False,
+            )
+            return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    client = OmicsOperations(_boto=build_boto_client(args.region, args.profile))
+
+    if args.list_runs:
+        items = list_all(client=client, operation="ListRuns", limit=args.limit)
+        data = map_list_report(items, kind="runs", region=args.region)
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.list_workflows:
+        filters: dict[str, Any] = {"type": args.workflow_type} if args.workflow_type else {}
+        items = list_all(
+            client=client, operation="ListWorkflows", limit=args.limit, **filters
+        )
+        data = map_list_report(items, kind="workflows", region=args.region)
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.start_run:
+        result = submit_run(client=client, request=start_run_request, confirmed=True)
+        run_id = str(result["response"].get("id", ""))
+    else:
+        run_id = args.run_status
+
+    if args.wait:
+        print(
+            f"Waiting for run {run_id} to reach a terminal state "
+            f"(polling every {args.poll_interval:.0f}s). The run keeps billing "
+            f"while this waits; Ctrl-C stops watching, not the run.",
+            file=sys.stderr,
+        )
+        wait_for_run(
+            client=client, run_id=run_id,
+            poll_seconds=args.poll_interval,
+            timeout_seconds=args.wait_timeout_seconds,
+        )
+
+    bundle = fetch_run_bundle(client=client, run_id=run_id)
+    data = map_run_report(
+        bundle, region=args.region, start_run_request=start_run_request,
+        submitted=bool(args.start_run),
+    )
+    return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="healthomics_bridge.py",
+        description=(
+            "Submit, monitor and import AWS HealthOmics runs via boto3, behind an "
+            "allow-listed client, an egress gate and a cost gate."
+        ),
+    )
+    parser.add_argument("--demo", action="store_true", help="Offline demo; no AWS account needed")
+    parser.add_argument(
+        "--output", type=Path, default=Path("output/healthomics"), help="Output directory"
+    )
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--list-runs", action="store_true", help="List recent runs (read-only)")
+    mode.add_argument("--list-workflows", action="store_true", help="List workflows (read-only)")
+    mode.add_argument("--run-status", metavar="RUN_ID", help="Report one run (read-only)")
+    mode.add_argument("--start-run", metavar="WORKFLOW_ID", help="Submit a run (gated)")
+
+    parser.add_argument(
+        "--workflow-type", choices=["PRIVATE", "READY2RUN"],
+        help=(
+            "Workflow type. REQUIRED with --start-run: AWS needs it to resolve a "
+            "Ready2Run workflow, and being explicit avoids the not-found error a "
+            "missing type produces. Also filters --list-workflows."
+        ),
+    )
+    parser.add_argument("--params", type=Path, help="JSON parameters file (with --start-run)")
+    parser.add_argument("--output-uri", help="S3 URI for run outputs (with --start-run)")
+    parser.add_argument("--role-arn", help="HealthOmics execution role ARN (with --start-run)")
+    parser.add_argument("--run-name", help="Run name (with --start-run)")
+    parser.add_argument("--storage-type", choices=["STATIC", "DYNAMIC"],
+                        help="Omit to take AWS's preferred DYNAMIC default")
+    parser.add_argument("--storage-capacity", type=int,
+                        help="Run storage in GiB; only meaningful with --storage-type STATIC")
+    parser.add_argument("--cache-id", help="Run cache to reuse task results from")
+    parser.add_argument("--cache-behavior", choices=["CACHE_ALWAYS", "CACHE_ON_FAILURE"])
+    parser.add_argument("--run-group-id", help="Run group, for concurrency and cost caps")
+    parser.add_argument("--workflow-version-name", help="Pin the workflow version to run")
+    parser.add_argument(
+        "--run-tags", metavar="JSON",
+        help=(
+            "Cost-allocation tags for the RUN as JSON, e.g. '{\"team\":\"genomics\"}'. "
+            "Per-run cost allocation, applied at submission time."
+        ),
+    )
+
+    parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
+    parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE"))
+    parser.add_argument("--limit", type=int, default=25, help="Max results for list modes")
+    parser.add_argument(
+        "--wait", action="store_true",
+        help="Poll until the run reaches a terminal state before reporting. "
+             "Watching does not stop billing, and Ctrl-C stops watching, not the run.",
+    )
+    parser.add_argument(
+        "--poll-interval", type=float, default=30.0,
+        help="Seconds between --wait polls (default: 30)",
+    )
+    parser.add_argument(
+        "--wait-timeout-seconds", type=float, default=86_400.0,
+        help="Give up watching after this long (default: 24h). The run continues.",
+    )
+    parser.add_argument(
+        "--allow-remote-inputs", action="store_true",
+        help="Acknowledge that submitting a run sends genomic data to AWS",
+    )
+    parser.add_argument(
+        "--confirm-submit", action="store_true",
+        help="Actually submit. Without it, --start-run only estimates and bills nothing.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    output_dir = args.output.expanduser().resolve()
+
+    if args.demo:
+        result = run_demo(output_dir)
+        print(json.dumps(result["summary"], indent=2))
+        return 0
+
+    if not any([args.list_runs, args.list_workflows, args.run_status, args.start_run]):
+        parser.error(
+            "choose one of --demo, --list-runs, --list-workflows, --run-status or --start-run"
+        )
+
+    if args.start_run:
+        missing = [
+            flag for flag, value in (
+                ("--params", args.params), ("--output-uri", args.output_uri),
+                ("--role-arn", args.role_arn), ("--run-name", args.run_name),
+                # Required rather than defaulted: guessing PRIVATE would make a
+                # Ready2Run submission fail with a bare not-found error, which
+                # is exactly the confusion this skill exists to avoid.
+                ("--workflow-type", args.workflow_type),
+            ) if not value
+        ]
+        if missing:
+            parser.error(f"--start-run requires {', '.join(missing)}")
+        if not args.params.exists():
+            parser.error(f"params file not found: {args.params}")
+        if args.storage_capacity is not None and args.storage_type != "STATIC":
+            parser.error(
+                "--storage-capacity only applies to STATIC run storage; add "
+                "--storage-type STATIC, or drop it and take the DYNAMIC default"
+            )
+        if args.cache_behavior and not args.cache_id:
+            parser.error("--cache-behavior requires --cache-id")
+
+    try:
+        result = _run_live(args, output_dir)
+    except (OmicsCallError, EgressRefused, ValueError, OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(result["summary"], indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

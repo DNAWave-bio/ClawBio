@@ -1,0 +1,25 @@
+{
+  "run": {
+    "id": "7654321",
+    "name": "clawbio-demo-rnaseq",
+    "status": "COMPLETED",
+    "workflowId": "1234567",
+    "workflowType": "PRIVATE",
+    "outputUri": "s3://clawbio-demo-bucket/healthomics/demo-run/",
+    "storageType": "DYNAMIC"
+  },
+  "workflow": {
+    "id": "1234567",
+    "name": "clawbio-demo-rnaseq",
+    "type": "PRIVATE",
+    "status": "ACTIVE"
+  },
+  "tasks": [
+    {"taskId": "task-0001", "name": "NFCORE_RNASEQ:FASTQC", "status": "COMPLETED",
+     "cpus": 2, "memory": 4, "startTime": "2026-09-02T10:00:00Z", "stopTime": "2026-09-02T10:04:00Z"},
+    {"taskId": "task-0002", "name": "NFCORE_RNASEQ:STAR_ALIGN", "status": "COMPLETED",
+     "cpus": 16, "memory": 64, "startTime": "2026-09-02T10:04:00Z", "stopTime": "2026-09-02T10:31:00Z"},
+    {"taskId": "task-0003", "name": "NFCORE_RNASEQ:SALMON_QUANT", "status": "FAILED",
+     "cpus": 8, "memory": 32, "startTime": "2026-09-02T10:31:00Z", "stopTime": "2026-09-02T10:33:00Z"}
+  ]
+}
