@@ -60,7 +60,7 @@ def test_destructive_operations_are_refused(operation):
 
 def test_allowlist_covers_only_what_this_skill_uses():
     assert ALLOWED_OPERATIONS == {
-        "ListRuns", "GetRun", "ListRunTasks",
+        "ListRuns", "GetRun", "ListRunTasks", "GetRunTask",
         "ListWorkflows", "GetWorkflow", "ListTagsForResource", "StartRun",
     }
     assert not any(op.startswith(("Delete", "Cancel", "Update")) for op in ALLOWED_OPERATIONS)
@@ -456,6 +456,69 @@ def test_a_failed_run_surfaces_why(tmp_path):
 
     assert "INVALID_ECR_IMAGE_URI" in report, "the run's own failure reason"
     assert "OutOfMemoryError" in report, "and the failing task's"
+
+
+def test_a_failed_task_gets_enriched_with_its_own_reason():
+    """ListRunTasks does not return statusMessage or failureReason -- only
+    GetRunTask does. A live private-workflow run proved this: the run-level
+    statusMessage came through, but the 'Failed tasks' section named the task
+    with no reason at all, even though AWS's GetRunTask held one
+    (failureReason: RUN_TASK_FAILED) the whole time.
+
+    Enrichment is scoped to failed tasks only. A large successful run must not
+    pay for N extra calls to learn nothing new."""
+    client = FakeOmics(
+        GetRun={"id": "7", "status": "FAILED"},
+        ListRunTasks={"items": [
+            {"taskId": "t1", "name": "Echo", "status": "FAILED"},
+            {"taskId": "t2", "name": "Setup", "status": "COMPLETED"},
+        ]},
+        GetRunTask={"failureReason": "RUN_TASK_FAILED",
+                    "statusMessage": "exec /bin/bash: exec format error"},
+    )
+    bundle = bridge.fetch_run_bundle(client=client, run_id="7")
+
+    failed = next(t for t in bundle["tasks"] if t["taskId"] == "t1")
+    assert failed["failureReason"] == "RUN_TASK_FAILED"
+    assert failed["statusMessage"] == "exec /bin/bash: exec format error"
+
+    ok = next(t for t in bundle["tasks"] if t["taskId"] == "t2")
+    assert "failureReason" not in ok, "a completed task needs no extra call"
+
+    get_run_task_calls = [kw for op, kw in client.calls if op == "GetRunTask"]
+    assert len(get_run_task_calls) == 1
+    assert get_run_task_calls[0] == {"id": "7", "taskId": "t1"}
+
+
+def test_task_enrichment_is_best_effort():
+    """A permissions gap or a task GetRunTask itself fails on must not sink an
+    otherwise good report -- the same posture as the tag lookup."""
+    class FlakyOnGetRunTask(FakeOmics):
+        def call(self, operation, **kwargs):
+            if operation == "GetRunTask":
+                raise RuntimeError("AccessDeniedException")
+            return super().call(operation, **kwargs)
+
+    client = FlakyOnGetRunTask(
+        GetRun={"id": "7", "status": "FAILED"},
+        ListRunTasks={"items": [{"taskId": "t1", "name": "Echo", "status": "FAILED"}]},
+    )
+    bundle = bridge.fetch_run_bundle(client=client, run_id="7")
+    assert bundle["tasks"][0]["status"] == "FAILED"
+
+
+def test_task_enrichment_is_capped():
+    """A run with many failed tasks should not turn one report into dozens of
+    extra API calls; the cap keeps the enrichment worth its cost."""
+    tasks = [{"taskId": f"t{i}", "name": f"Task{i}", "status": "FAILED"} for i in range(30)]
+    client = FakeOmics(
+        GetRun={"id": "7", "status": "FAILED"},
+        ListRunTasks={"items": tasks},
+        GetRunTask={"failureReason": "RUN_TASK_FAILED", "statusMessage": "x"},
+    )
+    bridge.fetch_run_bundle(client=client, run_id="7")
+    get_run_task_calls = [kw for op, kw in client.calls if op == "GetRunTask"]
+    assert len(get_run_task_calls) == bridge._MAX_TASKS_TO_ENRICH
 
 
 # ---------------------------------------------------------------------------

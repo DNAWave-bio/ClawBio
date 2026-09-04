@@ -132,7 +132,7 @@ Ready2Run submission fails with a confusing not-found error.
   no opinion about which are safe, and no record of what it did. `StartRun`
   spends real money and moves a genome into a cloud account; nothing in the
   SDK makes either fact visible beforehand.
-- **With it**: seven allow-listed operations of the 107 boto3 exposes, an
+- **With it**: eight allow-listed operations of the 107 boto3 exposes, an
   egress acknowledgement the user gives out loud, an estimate-first cost gate,
   and an idempotency token so a repeated submission is deduplicated rather
   than billed twice.
@@ -217,6 +217,8 @@ ceiling; it is not evidence that any AWS call works.
 2. Build the boto3 client lazily, so the demo needs no cloud dependency.
 3. Refuse any operation outside the allowlist before dispatch.
 4. `GetRun` → `ListRunTasks` → `GetWorkflow` for the run under inspection.
+   Failed/cancelled tasks each get a follow-up `GetRunTask` (capped at 25),
+   because `ListRunTasks` does not carry a task's own failure reason.
 5. Partition tasks into completed and failed/cancelled.
 6. Write the output contract and checksum it.
 
@@ -293,14 +295,22 @@ environment or instance role; this skill never reads, stores or forwards them.
 - **One real Ready2Run run submitted end to end** (ESMFold, fixed price
   $0.25). AWS recorded `workflowType: READY2RUN` and both run tags on the run
   resource, confirmed against AWS rather than inferred from the service model.
+- **One real PRIVATE workflow registered and submitted end to end**: a minimal
+  WDL, containerised, submitted with `--start-run --workflow-type PRIVATE
+  --wait`, reached `COMPLETED`, and its output file was read back from S3
+  containing the exact string passed in as a parameter. Two real failures were
+  hit and fixed along the way (see Gotchas: architecture mismatch, ECR
+  repository policy) — both surfaced through this skill's own reporting, not
+  through the AWS CLI or console.
 - **A rejected submission raises rather than returning data.** A deliberate
   first attempt with an input the execution role could not read produced a
-  `ValidationException` that propagated as an exception and billed nothing,
-  billed nothing — botocore raises, so a rejected submission cannot be mistaken
-  for data.
-- **Not yet exercised live**: `--run-status` against a FAILED run, and any
-  private-workflow submission through this transport. Both are covered only by
-  fixtures here.
+  `ValidationException` that propagated as an exception and billed nothing —
+  botocore raises, so a rejected submission cannot be mistaken for data.
+- **A FAILED run's own reason, and its failing task's reason, both confirmed
+  live.** The private-workflow run above failed twice before it succeeded;
+  both failures rendered their real AWS-supplied message in `report.md`,
+  including the task-level `GetRunTask` enrichment this section exists to
+  document.
 
 ## Gotchas
 
@@ -348,6 +358,47 @@ environment or instance role; this skill never reads, stores or forwards them.
 - **This skill can start a billable run but cannot stop one.** `CancelRun` is
   barred by name as a destructive operation. Stop a runaway run with
   `aws omics cancel-run --id <id>`.
+- **You will want to build a private workflow's container on Apple Silicon and
+  push it straight to ECR. Don't — HealthOmics only runs `linux/amd64`.** A
+  Mac-native build fails every task with `exec /bin/bash: exec format error`,
+  and that error surfaces from *inside the container*, well past this skill's
+  own gates — the request looked correct, `--confirm-submit` succeeded, and
+  the run still failed. Always `docker buildx build --platform linux/amd64`.
+- **A private submission can fail with `Unable to access image URI... Ensure
+  the ECR private repository... has granted access for the omics service
+  principle`, even though your execution role already has `ecr:BatchGetImage`
+  on that repository.** IAM role permissions and the ECR *repository policy*
+  are two different grants — HealthOmics needs both. The role lets the
+  identity call ECR; the repository policy lets `omics.amazonaws.com` itself
+  reach the repository at all:
+
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Sid": "AllowHealthOmicsPull",
+      "Effect": "Allow",
+      "Principal": {"Service": "omics.amazonaws.com"},
+      "Action": ["ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage",
+                 "ecr:BatchCheckLayerAvailability"]
+    }]
+  }
+  ```
+
+  `aws ecr set-repository-policy --repository-name <repo> --policy-text file://policy.json`
+  — a permission change, so it is not something this skill does or ever will;
+  see Safety. Verify the image is both correct-architecture and
+  correctly-granted *before* `--confirm-submit`, not after a failed run has
+  already billed for compute that never ran the workload:
+  `aws ecr describe-images` for the manifest's architecture, and
+  `aws ecr get-repository-policy` for the grant.
+- **A task's own failure reason needs a second call — `ListRunTasks` alone
+  does not carry it.** `GetRun`'s `statusMessage` and `ListRunTasks`'
+  per-task status are not the same information: the run-level message often
+  says only "see the failing task," and without a follow-up `GetRunTask` call
+  the "Failed tasks" section could name a task but never say why it failed.
+  This skill makes that follow-up automatically, for failed tasks only, up to
+  `_MAX_TASKS_TO_ENRICH` (25) per report.
 
 ## Safety
 

@@ -26,16 +26,23 @@ from typing import Any, Protocol
 # CreateWorkflow is absent too, for a different reason: this skill submits runs
 # against workflows that already exist and has no --register mode to reach it.
 # Allow-listing an operation no CLI mode can invoke would overstate this
-# skill's blast radius, so the allowlist holds exactly the
-# six operations its code paths actually call — enforced by
-# test_every_allow_listed_operation_is_actually_reachable. GetRunTask is absent
-# for the same reason: ListRunTasks already returns each task's status,
-# resources and timings, so nothing here needs the per-task detail call.
+# skill's blast radius, so the allowlist holds exactly the operations its code
+# paths actually call — enforced by
+# test_every_allow_listed_operation_is_actually_reachable.
+#
+# GetRunTask *was* dropped on the reasoning that ListRunTasks already returns
+# each task's status, resources and timings. That reasoning missed one field:
+# ListRunTasks does not return statusMessage or failureReason, so a failed
+# task's own reason was unreachable and the "Failed tasks" section could name
+# a task but never say why. A live private-workflow run exposed this -- the
+# run-level statusMessage came through, the task-level one did not, even
+# though GetRunTask held it (failureReason: RUN_TASK_FAILED) the whole time.
 ALLOWED_OPERATIONS = frozenset(
     {
         "ListRuns",
         "GetRun",
         "ListRunTasks",
+        "GetRunTask",
         "ListWorkflows",
         "GetWorkflow",
         "ListTagsForResource",

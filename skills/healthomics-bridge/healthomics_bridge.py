@@ -315,6 +315,28 @@ def normalise_storage_capacity(requested: int, *, announce: bool = False) -> int
     return allocated
 
 
+def _enrich_failed_tasks(*, client: OmicsClient, run_id: str, tasks: list[dict[str, Any]]) -> None:
+    """Fetch the one field ListRunTasks omits: why a failed task failed.
+
+    Mutates ``tasks`` in place. Scoped to FAILED/CANCELLED tasks, capped at
+    ``_MAX_TASKS_TO_ENRICH``, and best-effort per task -- a permissions gap or
+    a single GetRunTask failure must not sink an otherwise good report, the
+    same posture as the tag lookup above it.
+    """
+    failed = [t for t in tasks if str(t.get("status", "")).upper() in {"FAILED", "CANCELLED"}]
+    for task in failed[:_MAX_TASKS_TO_ENRICH]:
+        task_id = task.get("taskId")
+        if not task_id:
+            continue
+        try:
+            detail = client.call("GetRunTask", id=str(run_id), taskId=str(task_id))
+        except Exception:
+            continue
+        for field in ("statusMessage", "failureReason"):
+            if detail.get(field):
+                task[field] = detail[field]
+
+
 def fetch_run_bundle(*, client: OmicsClient, run_id: str) -> dict[str, Any]:
     """Everything one run report needs, in as few calls as possible.
 
@@ -328,6 +350,7 @@ def fetch_run_bundle(*, client: OmicsClient, run_id: str) -> dict[str, Any]:
     run = client.call("GetRun", id=str(run_id))
     tasks_response = client.call("ListRunTasks", id=str(run_id))
     tasks = list(tasks_response.get("items", []))
+    _enrich_failed_tasks(client=client, run_id=run_id, tasks=tasks)
 
     workflow: dict[str, Any] = {}
     workflow_id = run.get("workflowId")
