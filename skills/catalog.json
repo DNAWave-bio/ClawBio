@@ -2299,24 +2299,24 @@
     },
     {
       "name": "healthomics-bridge",
-      "cli_alias": null,
+      "cli_alias": "healthomics",
       "description": "Submit, monitor and import AWS HealthOmics genomics runs through the boto3 API directly, behind an allow-listed client, a fail-closed data-egress gate and an estimate-first cost gate.",
       "version": "0.1.0",
-      "status": "planned",
-      "maturity_tier": "tested",
+      "status": "mvp",
+      "maturity_tier": "cli-registered",
       "maturity_evidence": {
         "has_skill_md": true,
         "has_script": true,
         "has_tests": true,
         "has_demo": true,
-        "cli_registered": false,
+        "cli_registered": true,
         "ci_tested": false,
         "benchmark_validated": false
       },
       "has_script": true,
       "has_tests": true,
       "has_demo": true,
-      "demo_command": "python skills/healthomics-bridge/healthomics_bridge.py --demo",
+      "demo_command": "python clawbio.py run healthomics --demo",
       "dependencies": [
         "python>=3.11",
         "boto3>=1.34"

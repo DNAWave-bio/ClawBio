@@ -63,6 +63,9 @@ def test_allowlist_covers_only_what_this_skill_uses():
         "ListRuns", "GetRun", "ListRunTasks", "GetRunTask",
         "ListWorkflows", "GetWorkflow", "ListTagsForResource",
         "CreateWorkflow", "StartRun",
+        "ListRunGroups", "GetRunGroup", "ListRunCaches", "GetRunCache",
+        "TagResource", "UntagResource",
+        "CreateWorkflowVersion", "GetWorkflowVersion", "ListWorkflowVersions",
     }
     assert not any(op.startswith(("Delete", "Cancel", "Update")) for op in ALLOWED_OPERATIONS)
 
@@ -152,8 +155,8 @@ def test_request_uses_the_api_field_names_verbatim():
 
 
 def test_run_tags_are_expressible():
-    """Tags are how a run is attributed in Cost Explorer. They can only be set
-    at submission time -- there is no API to add them to a run afterwards."""
+    """Tags are how a run is attributed in Cost Explorer, so submission must be
+    able to carry them before the run ever starts."""
     request = bridge.build_start_run_request(
         workflow_id="1", workflow_type="PRIVATE", params={}, output_uri="s3://b/o/",
         role_arn="arn:aws:iam::000000000000:role/r", run_name="n",
@@ -822,3 +825,474 @@ def test_provenance_still_admits_unchecked_outputs_when_they_are(tmp_path):
     report = (tmp_path / "report.md").read_text(encoding="utf-8")
 
     assert "--verify-outputs" in report, "and it must say how to change that"
+
+
+def test_a_failed_registration_surfaces_aws_own_reason(tmp_path):
+    """GetWorkflow returns statusMessage -- verified against botocore's output
+    shape -- and this skill already reads that field for run and task
+    failures. Registration discarded it and printed a generic guess instead."""
+    wdl = tmp_path / "main.wdl"; wdl.write_text("version 1.0\n")
+    client = FakeOmics(
+        ListWorkflows={"items": []},
+        CreateWorkflow={"id": "999"},
+        GetWorkflow={"id": "999", "status": "FAILED",
+                     "statusMessage": "definitionZip: entrypoint not found"},
+    )
+    result = bridge.register_run_workflow(
+        client=client, definition=wdl, additional_files=[], name="my-wf",
+        engine=None, description=None, parameter_template=None,
+        allow_duplicate=False, confirmed=True, output_dir=tmp_path)
+
+    assert result["workflow_status_message"] == "definitionZip: entrypoint not found"
+
+    data = bridge._pad_transfer_report(result, "us-east-1")
+    bridge.write_bundle(tmp_path / "out", data, warn_before_overwrite=False)
+    report = (tmp_path / "out" / "report.md").read_text(encoding="utf-8")
+    assert "entrypoint not found" in report
+
+
+def test_a_failed_task_reports_where_its_logs_live(tmp_path):
+    """GetRunTask returns logStream -- a CloudWatch ARN -- for every task, and
+    it was fetched and discarded. A user reading 'Failed tasks' had to find
+    the log location by hand; this puts the ARN and a ready command in the
+    report next to the failure reason it already prints."""
+    client = FakeOmics(
+        GetRun={"id": "7", "status": "FAILED"},
+        ListRunTasks={"items": [{"taskId": "t1", "name": "Echo", "status": "FAILED"}]},
+        GetRunTask={
+            "failureReason": "RUN_TASK_FAILED", "statusMessage": "boom",
+            "logStream": "arn:aws:logs:us-east-1:0:log-group:/aws/omics/WorkflowLog:log-stream:run/7/task/t1",
+        },
+    )
+    bundle = bridge.fetch_run_bundle(client=client, run_id="7")
+    assert bundle["tasks"][0]["logStream"].endswith("run/7/task/t1")
+
+    data = bridge.map_run_report(bundle, region="us-east-1")
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "run/7/task/t1" in report
+    assert "aws logs get-log-events" in report
+
+
+# ---------------------------------------------------------------------------
+# Discovery: run groups and run caches referenced (but never listable) by
+# --start-run's --run-group-id / --cache-id
+# ---------------------------------------------------------------------------
+
+
+def test_list_run_groups_tabulates_groups(tmp_path):
+    data = bridge.map_list_report(
+        [{"id": "g1", "name": "cohort-a", "maxCpus": 100}],
+        kind="run-groups", region="us-east-1",
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    rows = (tmp_path / "tables" / "run-groups.csv").read_text(encoding="utf-8")
+    assert "g1" in rows and "cohort-a" in rows
+
+
+def test_list_run_caches_tabulates_caches(tmp_path):
+    data = bridge.map_list_report(
+        [{"id": "c1", "name": "shared-cache", "status": "ACTIVE"}],
+        kind="run-caches", region="us-east-1",
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    rows = (tmp_path / "tables" / "run-caches.csv").read_text(encoding="utf-8")
+    assert "c1" in rows and "shared-cache" in rows
+
+
+def test_cli_list_run_groups_calls_only_that_operation(tmp_path):
+    with pytest.raises(SystemExit):
+        # --list-run-groups and --start-run are different modes; mixing them
+        # must be refused before any client is built.
+        bridge.main(["--list-run-groups", "--start-run", "1", "--output", str(tmp_path)])
+
+
+# ---------------------------------------------------------------------------
+# Post-submission tagging -- ListTagsForResource had no write-side pair
+# ---------------------------------------------------------------------------
+
+
+def test_tag_run_calls_tag_resource_with_the_runs_arn(tmp_path):
+    client = FakeOmics(
+        GetRun={"id": "7", "status": "COMPLETED", "arn": "arn:aws:omics:us-east-1:0:run/7"},
+        TagResource=lambda **kw: {},
+    )
+    result = bridge.tag_run(client=client, run_id="7", tags={"team": "genomics"})
+    calls = {op: kw for op, kw in client.calls}
+    assert calls["TagResource"] == {
+        "resourceArn": "arn:aws:omics:us-east-1:0:run/7", "tags": {"team": "genomics"}}
+    assert result["tagged"] == {"team": "genomics"}
+
+
+def test_untag_run_calls_untag_resource_with_keys():
+    client = FakeOmics(
+        GetRun={"id": "7", "status": "COMPLETED", "arn": "arn:aws:omics:us-east-1:0:run/7"},
+        UntagResource=lambda **kw: {},
+    )
+    bridge.untag_run(client=client, run_id="7", keys=["team", "stale"])
+    calls = {op: kw for op, kw in client.calls}
+    assert calls["UntagResource"] == {
+        "resourceArn": "arn:aws:omics:us-east-1:0:run/7", "tagKeys": ["team", "stale"]}
+
+
+def test_list_run_tags_reads_the_runs_resource_tags(tmp_path):
+    client = FakeOmics(
+        GetRun={"id": "7", "status": "COMPLETED", "arn": "arn:aws:omics:us-east-1:0:run/7"},
+        ListTagsForResource={"tags": {"team": "genomics", "project": "atlas"}},
+    )
+    result = bridge.list_run_tags(client=client, run_id="7")
+
+    assert result["tags"] == {"team": "genomics", "project": "atlas"}
+    calls = {op: kw for op, kw in client.calls}
+    assert calls["ListTagsForResource"] == {
+        "resourceArn": "arn:aws:omics:us-east-1:0:run/7"}
+
+    data = bridge._pad_transfer_report(result, "us-east-1")
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    assert "project,atlas" in (tmp_path / "tables" / "tags.csv").read_text(encoding="utf-8")
+
+
+def test_sync_run_tags_sets_changed_keys_and_removes_stale_ones():
+    client = FakeOmics(
+        GetRun={"id": "7", "status": "COMPLETED", "arn": "arn:aws:omics:us-east-1:0:run/7"},
+        ListTagsForResource={"tags": {"team": "old", "stale": "yes"}},
+        TagResource={},
+        UntagResource={},
+    )
+
+    result = bridge.sync_run_tags(
+        client=client,
+        run_id="7",
+        desired_tags={"team": "genomics", "project": "atlas"},
+    )
+
+    calls = client.calls
+    assert calls[2] == (
+        "TagResource",
+        {
+            "resourceArn": "arn:aws:omics:us-east-1:0:run/7",
+            "tags": {"team": "genomics", "project": "atlas"},
+        },
+    )
+    assert calls[3] == (
+        "UntagResource",
+        {"resourceArn": "arn:aws:omics:us-east-1:0:run/7", "tagKeys": ["stale"]},
+    )
+    assert result["tags"] == {"team": "genomics", "project": "atlas"}
+
+
+def test_sync_tags_replay_includes_the_desired_json(tmp_path):
+    data = bridge._pad_transfer_report(
+        {"mode": "sync-tags", "run_id": "7", "arn": "arn:aws:omics:us-east-1:0:run/7",
+         "desired_tags": {"team": "genomics"}, "tags": {"team": "genomics"},
+         "set": {"team": "genomics"}, "removed": []},
+        "us-east-1",
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    replay = (tmp_path / "reproducibility" / "commands.sh").read_text(encoding="utf-8")
+
+    assert "--sync-tags" in replay
+    assert "--tags" in replay
+    assert "genomics" in replay
+
+
+def test_cli_tag_run_requires_tags_flag():
+    """Consistent with this skill's own consequence rule, not verb rule: tag_run
+    creates no resource, costs nothing, and is undone by --untag-run -- the same
+    class CreateWorkflow was justified as ungated by. Unlike --start-run or
+    --register, there is no --confirm-tag; --tags is the only requirement, and
+    its absence is what --main refuses here."""
+    with pytest.raises(SystemExit):
+        bridge.main(["--tag-run", "7", "--output", "/tmp/x"])
+
+
+def test_cli_sync_tags_requires_tags_flag():
+    with pytest.raises(SystemExit):
+        bridge.main(["--sync-tags", "7", "--output", "/tmp/x"])
+
+
+# ---------------------------------------------------------------------------
+# Workflow versions -- --start-run already accepted --workflow-version-name
+# with no --register path that could ever create one
+# ---------------------------------------------------------------------------
+
+
+def test_register_a_version_of_an_existing_workflow(tmp_path):
+    wdl = tmp_path / "main.wdl"; wdl.write_text("version 1.0\n")
+    client = FakeOmics(
+        CreateWorkflowVersion={"workflowId": "1234567", "versionName": "v2",
+                               "status": "CREATING"},
+        GetWorkflowVersion={"workflowId": "1234567", "versionName": "v2",
+                            "status": "ACTIVE"},
+    )
+    result = bridge.register_workflow_version(
+        client=client, workflow_id="1234567", definition=wdl,
+        additional_files=[], version_name="v2", description=None,
+        parameter_template=None, confirmed=True, output_dir=tmp_path)
+
+    assert result["registered"] is True
+    assert result["version_status"] == "ACTIVE"
+    calls = [op for op, _ in client.calls]
+    assert "CreateWorkflowVersion" in calls
+
+
+def test_list_workflow_versions_tabulates_them(tmp_path):
+    data = bridge.map_list_report(
+        [{"workflowId": "1", "versionName": "v1", "status": "ACTIVE"}],
+        kind="workflow-versions", region="us-east-1",
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    rows = (tmp_path / "tables" / "workflow-versions.csv").read_text(encoding="utf-8")
+    assert "v1" in rows
+
+
+# ---------------------------------------------------------------------------
+# The new operations must be reachable, or the allowlist overstates itself
+# ---------------------------------------------------------------------------
+
+
+def test_all_new_operations_are_allow_listed_and_reachable():
+    from omics_client import ALLOWED_OPERATIONS
+    for op in ("ListRunGroups", "GetRunGroup", "ListRunCaches", "GetRunCache",
+               "TagResource", "UntagResource", "CreateWorkflowVersion",
+               "GetWorkflowVersion", "ListWorkflowVersions"):
+        assert op in ALLOWED_OPERATIONS, f"{op} must be allow-listed"
+
+
+# ---------------------------------------------------------------------------
+# The replay command must match the mode that produced the bundle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode,expected_flag", [
+    ("upload", "--upload-inputs"),
+    ("download", "--download-outputs"),
+    ("register", "--register"),
+    ("tag", "--tag-run"),
+    ("untag", "--untag-run"),
+    ("register-version", "--register"),
+])
+def test_replay_command_matches_the_mode_that_wrote_it(tmp_path, mode, expected_flag):
+    """A real bundle from this session replayed `--run-status ""` for every
+    non-run mode -- commands.sh silently claimed to reproduce a report it
+    could not, because the builder only ever branched on runs/workflows vs
+    everything else."""
+    data = bridge._pad_transfer_report(
+        {"mode": mode, "run_id": "7", "destination": "s3://b/o/", "source": "s3://b/o/",
+         "workflow_id": "1", "version_name": "v2", "sources": [], "tagged": {},
+         "untagged": [], "arn": "arn:x", "uploaded": True, "downloaded": True,
+         "registered": True, "workflow_status": "ACTIVE", "workflow_name": "w",
+         "engine": "WDL", "definition_path": "/tmp/main.wdl",
+         "version_status": "ACTIVE", "version_status_message": None,
+         "workflow_status_message": None, "name_collisions": [],
+         "n_uploaded": 1, "n_bytes": 1, "uris": ["s3://b/o/x"], "uploaded_files": [],
+         "n_downloaded": 1, "n_objects": 1,
+         "zip": {"members": [], "n_bytes": 1, "sha256": "a" * 64}},
+        "us-east-1",
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    replay = (tmp_path / "reproducibility" / "commands.sh").read_text(encoding="utf-8")
+    assert expected_flag in replay
+    assert '--run-status \\\n   \\\n' not in replay, "must not silently fall back to an empty --run-status"
+
+
+def test_register_version_replay_uses_the_version_creation_flags(tmp_path):
+    data = bridge._pad_transfer_report(
+        {"mode": "register-version", "workflow_id": "wf-1", "version_name": "v2",
+         "definition_path": "/tmp/main.wdl", "engine": "WDL", "registered": True,
+         "version_status": "ACTIVE", "version_status_message": None,
+         "zip": {"members": [], "n_bytes": 1, "sha256": "a" * 64}},
+        "us-east-1",
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    replay = (tmp_path / "reproducibility" / "commands.sh").read_text(encoding="utf-8")
+
+    assert "--workflow-id" in replay
+    assert "--new-version-name" in replay
+    assert "--workflow-version-name" not in replay
+
+
+def test_tag_replay_includes_the_tags_it_sent(tmp_path):
+    data = bridge._pad_transfer_report(
+        {"mode": "tag", "run_id": "7", "arn": "arn:aws:omics:us-east-1:0:run/7",
+         "tagged": {"team": "genomics"}},
+        "us-east-1",
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    replay = (tmp_path / "reproducibility" / "commands.sh").read_text(encoding="utf-8")
+
+    assert "--tags" in replay
+    assert "team" in replay
+    assert "genomics" in replay
+
+
+def test_untag_replay_includes_the_keys_it_removed(tmp_path):
+    data = bridge._pad_transfer_report(
+        {"mode": "untag", "run_id": "7", "arn": "arn:aws:omics:us-east-1:0:run/7",
+         "untagged": ["team", "stale"]},
+        "us-east-1",
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    replay = (tmp_path / "reproducibility" / "commands.sh").read_text(encoding="utf-8")
+
+    assert "--tag-keys" in replay
+    assert "team" in replay
+    assert "stale" in replay
+
+
+def test_workflow_version_listing_replay_keeps_the_workflow_id(tmp_path):
+    data = bridge.map_list_report(
+        [{"workflowId": "wf-1", "versionName": "v1", "status": "ACTIVE"}],
+        kind="workflow-versions", region="us-east-1",
+    )
+    data["workflow_id"] = "wf-1"
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    replay = (tmp_path / "reproducibility" / "commands.sh").read_text(encoding="utf-8")
+
+    assert "--list-workflow-versions" in replay
+    assert "wf-1" in replay
+
+
+def test_check_mode_writes_preflight_bundle(tmp_path):
+    result = bridge.main(["--check", "--output", str(tmp_path)])
+
+    assert result == 0
+    envelope = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert envelope["summary"]["kind"] == "check"
+    assert (tmp_path / "tables" / "checks.csv").exists()
+    assert (tmp_path / "reproducibility" / "replay_manifest.json").exists()
+
+
+def test_preflight_warns_about_unacknowledged_remote_paths(tmp_path):
+    params = tmp_path / "params.json"
+    params.write_text(json.dumps({"reads": "s3://bucket/reads.fastq.gz"}))
+    args = bridge.build_parser().parse_args(
+        [
+            "--check", "--start-run", "wf-1", "--workflow-type", "PRIVATE",
+            "--params", str(params), "--output-uri", "s3://bucket/out/",
+            "--role-arn", "arn:aws:iam::000000000000:role/omics",
+            "--run-name", "run", "--output", str(tmp_path / "out"),
+        ]
+    )
+
+    report = bridge._preflight.run_preflight(args)
+    by_name = {check["name"]: check for check in report["checks"]}
+    assert by_name["egress_acknowledgement"]["ok"] is False
+    assert "allow-remote-inputs" in by_name["egress_acknowledgement"]["detail"]
+
+
+def test_workflow_recommendation_prefers_relevant_active_items():
+    items = [
+        {"id": "1", "name": "Unrelated", "status": "ACTIVE", "type": "READY2RUN"},
+        {"id": "2", "name": "ESMFold protein structure", "status": "ACTIVE", "type": "READY2RUN"},
+    ]
+
+    rec = bridge._recommendations.recommend_workflows(items, "protein folding", limit=1)
+
+    assert rec["recommendations"][0]["id"] == "2"
+    assert "protein structure" in rec["inferred_domains"]
+
+
+def test_params_template_writes_json_skeleton(tmp_path):
+    payload = bridge._params_template.workflow_params_payload(
+        {
+            "id": "wf-1", "name": "demo", "type": "PRIVATE",
+            "parameterTemplate": {
+                "message": {"type": "String"},
+                "n": {"type": "Integer", "default": 3},
+            },
+        }
+    )
+    data = bridge.map_params_template_report(payload, region="us-east-1")
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+
+    skeleton = json.loads((tmp_path / "params.template.json").read_text(encoding="utf-8"))
+    assert skeleton == {"message": "", "n": 3}
+    assert "params-template" in (tmp_path / "reproducibility" / "commands.sh").read_text(encoding="utf-8")
+
+
+def test_output_verification_writes_outputs_and_handoff_json(tmp_path):
+    data = bridge.map_run_report(
+        {
+            "run": {"id": "7", "status": "COMPLETED", "workflowId": "wf", "outputUri": "s3://b/out/"},
+            "workflow": {},
+            "tasks": [],
+        },
+        region="us-east-1",
+        verification={
+            "depth": "deep", "source": "s3://b/out/7/", "complete": True,
+            "n_objects": 1, "n_bytes": 1,
+            "objects": [{
+                "key": "out/result.vcf", "size": 1, "etag": "abc",
+                "is_md5": True, "sha256": "a" * 64,
+                "local_path": str(tmp_path / "result.vcf"),
+            }],
+        },
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+
+    outputs = json.loads((tmp_path / "outputs.json").read_text(encoding="utf-8"))
+    handoff = json.loads((tmp_path / "handoff.json").read_text(encoding="utf-8"))
+    assert outputs["complete"] is True
+    assert handoff["items"][0]["suggested_skills"][0] == "variant-annotation"
+
+
+def test_error_bundle_writes_stable_error_code(tmp_path):
+    args = bridge.build_parser().parse_args(["--check", "--output", str(tmp_path)])
+    bridge._write_error_bundle(
+        tmp_path,
+        args,
+        bridge.EgressRefused("Re-run with --allow-remote-inputs to acknowledge egress."),
+    )
+
+    envelope = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert envelope["ok"] is False
+    assert envelope["summary"]["error_code"] == "EGRESS_REFUSED"
+
+
+def test_main_writes_error_bundle_for_generic_live_exception(tmp_path, monkeypatch):
+    def fail(_args, _output_dir):
+        raise RuntimeError("ResourceNotFoundException: Workflow 0 not found")
+
+    monkeypatch.setattr(bridge, "_run_live", fail)
+
+    result = bridge.main(["--list-runs", "--output", str(tmp_path)])
+
+    assert result == 1
+    envelope = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert envelope["ok"] is False
+    assert envelope["summary"]["error_code"] == "WORKFLOW_NOT_FOUND"
+
+
+def test_error_code_matching_does_not_call_every_workflow_error_not_found():
+    assert (
+        bridge._error_codes.error_code_for_exception(RuntimeError("workflow failed validation"))
+        == "REGISTRATION_FAILED"
+    )
+
+
+def test_describe_run_group_calls_get_run_group():
+    client = FakeOmics(GetRunGroup={"id": "g1", "name": "cohort-a", "maxCpus": 100})
+    result = bridge.describe_run_group(client=client, group_id="g1")
+    assert [op for op, _ in client.calls] == ["GetRunGroup"]
+    assert result["name"] == "cohort-a"
+
+
+def test_describe_run_cache_calls_get_run_cache():
+    client = FakeOmics(GetRunCache={"id": "c1", "name": "shared", "status": "ACTIVE"})
+    result = bridge.describe_run_cache(client=client, cache_id="c1")
+    assert [op for op, _ in client.calls] == ["GetRunCache"]
+    assert result["status"] == "ACTIVE"
+
+
+@pytest.mark.parametrize("kind", ["run-groups", "run-caches", "workflow-versions"])
+def test_new_list_modes_get_the_list_summary_shape_not_the_run_one(tmp_path, kind):
+    """A live --list-run-groups printed run_id/run_status/n_tasks -- the
+    run-report summary -- because write_bundle's summary branch only checked
+    for 'runs'/'workflows', the same two modes _LIST_MODES was extended past
+    when these three were added."""
+    data = bridge.map_list_report([{"id": "g1", "name": "x"}], kind=kind, region="us-east-1")
+    result = bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    assert result["summary"]["kind"] == kind
+    assert "n_items" in result["summary"]
+    assert "run_id" not in result["summary"]

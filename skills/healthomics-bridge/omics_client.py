@@ -50,6 +50,25 @@ ALLOWED_OPERATIONS = frozenset(
         "ListTagsForResource",
         "CreateWorkflow",
         "StartRun",
+        # Read-only discovery for two ids --start-run already accepts blind:
+        # --run-group-id and --cache-id had no way to see what exists first.
+        "ListRunGroups",
+        "GetRunGroup",
+        "ListRunCaches",
+        "GetRunCache",
+        # The write half of ListTagsForResource. Tags were previously settable
+        # only at --start-run time, with no path back to correct or add them
+        # afterward -- the one operation in this API that is genuinely this
+        # skill's own job, just missing its other half.
+        "TagResource",
+        "UntagResource",
+        # --start-run already accepted --workflow-version-name with no
+        # --register path that could ever create one. CreateWorkflowVersion
+        # closes that asymmetry; ListWorkflowVersions makes the versions it
+        # creates visible.
+        "CreateWorkflowVersion",
+        "GetWorkflowVersion",
+        "ListWorkflowVersions",
     }
 )
 

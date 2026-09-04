@@ -7,7 +7,10 @@
     "healthomics boto3",
     "aws omics api",
     "ready2run",
-    "healthomics bridge boto3"
+    "healthomics bridge boto3",
+    "healthomics workflow search",
+    "healthomics params template",
+    "healthomics run tags"
   ],
   "routes": [
     {
@@ -24,6 +27,85 @@
           "kind": "skill_run",
           "skill": "healthomics-bridge",
           "demo": true
+        }
+      ]
+    },
+    {
+      "intent_id": "preflight_check",
+      "description": "Check HealthOmics bridge readiness before any live action.",
+      "trigger_terms": [
+        "healthomics preflight",
+        "check healthomics setup",
+        "healthomics readiness"
+      ],
+      "demo_policy": "never",
+      "plan": [
+        {
+          "kind": "skill_run",
+          "skill": "healthomics-bridge",
+          "args": [
+            "--check"
+          ]
+        }
+      ]
+    },
+    {
+      "intent_id": "workflow_discovery",
+      "description": "Search or recommend HealthOmics workflows before submission.",
+      "trigger_terms": [
+        "find healthomics workflow",
+        "recommend ready2run workflow",
+        "search aws omics workflows"
+      ],
+      "demo_policy": "never",
+      "plan": [
+        {
+          "kind": "skill_run",
+          "skill": "healthomics-bridge",
+          "args": [
+            "--search-workflows",
+            "{query}"
+          ]
+        }
+      ]
+    },
+    {
+      "intent_id": "params_template",
+      "description": "Generate a starter parameters JSON skeleton for a workflow.",
+      "trigger_terms": [
+        "healthomics params template",
+        "generate healthomics params",
+        "starter params for ready2run"
+      ],
+      "demo_policy": "never",
+      "plan": [
+        {
+          "kind": "skill_run",
+          "skill": "healthomics-bridge",
+          "args": [
+            "--params-template",
+            "{workflow_id}"
+          ]
+        }
+      ]
+    },
+    {
+      "intent_id": "run_tags",
+      "description": "Read or converge tags on an existing HealthOmics run.",
+      "trigger_terms": [
+        "healthomics run tags",
+        "tag healthomics run",
+        "sync healthomics tags"
+      ],
+      "demo_policy": "never",
+      "plan": [
+        {
+          "kind": "skill_run",
+          "skill": "healthomics-bridge",
+          "args": [
+            "--list-tags",
+            "{run_id}"
+          ]
         }
       ]
     }

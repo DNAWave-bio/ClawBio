@@ -97,12 +97,17 @@ cat /tmp/ho/report.md
 |---|---|
 | See my recent runs | `--list-runs --output out/` |
 | See workflows (either type) | `--list-workflows [--workflow-type READY2RUN] --output out/` |
+| Check readiness without acting | `--check --start-run WF --workflow-type PRIVATE --params p.json --output-uri s3://bucket/out/ --role-arn arn:... --run-name trial --output out/` |
+| Search workflows | `--search-workflows "protein folding" [--workflow-type READY2RUN] --output out/` |
+| Recommend workflows | `--recommend-workflow "call variants from FASTQ" --output out/` |
+| Generate params skeleton | `--params-template WORKFLOW_ID [--workflow-type READY2RUN] --output out/` |
 | Check on one run | `--run-status RUN_ID --output out/` |
 | **Upload a run's inputs** | `--upload-inputs f1 f2 --to s3://bucket/in/ --allow-remote-inputs --confirm-upload` |
 | **Register a WDL/CWL/Nextflow definition** | `--register main.wdl --workflow-name my-wf --confirm-register` |
 | Submit a run | see **Submitting a run** — two steps, not one |
 | **Download a run's outputs** | `--download-outputs RUN_ID --to ./results/ --confirm-download` |
 | **Verify what a run produced** | `--run-status RUN_ID --verify-outputs [deep]` |
+| Manage run tags | `--list-tags RUN_ID`, `--tag-run RUN_ID --tags '{"team":"genomics"}'`, `--sync-tags RUN_ID --tags '{"team":"genomics"}'` |
 
 **Submitting is two steps on purpose**: run `--start-run` alone first — it builds
 and prints the exact request and bills nothing — then add `--confirm-submit`
@@ -136,7 +141,7 @@ Ready2Run submission fails with a confusing not-found error.
   no opinion about which are safe, and no record of what it did. `StartRun`
   spends real money and moves a genome into a cloud account; nothing in the
   SDK makes either fact visible beforehand.
-- **With it**: nine allow-listed operations of the 107 boto3 exposes, an
+- **With it**: 18 allow-listed operations of the 107 boto3 exposes, an
   egress acknowledgement the user gives out loud, an estimate-first cost gate,
   and an idempotency token so a repeated submission is deduplicated rather
   than billed twice.
@@ -169,6 +174,19 @@ Ready2Run submission fails with a confusing not-found error.
    `--confirm-register`.
 10. **Output verification**: `--verify-outputs` records what a run actually
     produced — a cheap listing, or real SHA-256 checksums with `deep`.
+11. **Preflight checks**: `--check` reports local/AWS readiness without creating
+    resources, submitting runs or moving bytes.
+12. **Workflow discovery**: `--search-workflows` and `--recommend-workflow`
+    borrow the Galaxy/Bioconductor pattern: plain-language discovery before a
+    user has memorised HealthOmics ids.
+13. **Params scaffolding**: `--params-template` writes a starter
+    `params.template.json` from a workflow's exposed parameter template.
+14. **Downstream handoff**: verified or downloaded outputs produce
+    `outputs.json` and `handoff.json` with suggested ClawBio next skills.
+15. **Structured failures**: failed CLI runs write `result.json` with a stable
+    `error_code` where the output directory is writable.
+16. **Tag governance**: `--list-tags`, `--tag-run`, `--untag-run` and
+    `--sync-tags` make run cost/allocation metadata auditable after submission.
 
 ## Scope
 
@@ -190,12 +208,13 @@ them.
 | Run identifier | `--run-status` | `7654321` |
 | Parameters `.json` | `--params` with `--start-run` | `{"greeting": "hi"}` |
 | Run tags JSON | `--run-tags` with `--start-run` | `{"team":"genomics"}` |
+| Desired run tags JSON | `--tags` with `--tag-run` / `--sync-tags` | `{"team":"genomics","project":"atlas"}` |
 
 ## Workflow
 
 1. **Resolve mode (prescriptive)**: exactly one of `--demo`, `--list-runs`,
    `--list-workflows`, `--run-status`, `--start-run`, `--upload-inputs`,
-   `--download-outputs`, `--register`.
+   `--download-outputs`, `--register`, discovery, params, or tag modes.
 2. **Short-circuit the demo (prescriptive)**: `--demo` returns before any
    region, credential, network path or boto3 import is touched.
 3. **Gate egress (prescriptive)**: for `--start-run`, refuse without
@@ -212,11 +231,19 @@ them.
 | Flag | Mode / applies to | Notes |
 |---|---|---|
 | `--demo` | offline | Short-circuits everything; no boto3, no credentials |
+| `--check` | preflight | Can stand alone or accompany a planned operation; exits before any live action |
 | `--list-runs` | read-only | `--limit` bounds results |
 | `--list-workflows` | read-only | `--workflow-type PRIVATE\|READY2RUN` filters |
+| `--search-workflows QUERY` | read-only | Scores workflows by name, description, id and type |
+| `--recommend-workflow TASK` | read-only | Heuristic task-to-workflow recommendation |
+| `--params-template WORKFLOW_ID` | read-only | Writes `params.template.json`; accepts `--workflow-type` and `--workflow-version-name` |
 | `--run-status RUN_ID` | read-only | Run, tasks and workflow in one report |
 | `--start-run WORKFLOW_ID` | gated | Requires `--workflow-type`, `--params`, `--output-uri`, `--role-arn`, `--run-name`; `--allow-remote-inputs` + `--confirm-submit` to pass both gates |
 | `--run-tags JSON` | `--start-run` | Per-run cost allocation |
+| `--list-tags RUN_ID` | read-only | Reads run tags from AWS by resource ARN |
+| `--tag-run RUN_ID --tags JSON` | metadata mutation | Sets or updates the supplied keys on an existing run |
+| `--untag-run RUN_ID --tag-keys KEY...` | metadata mutation | Removes supplied tag keys |
+| `--sync-tags RUN_ID --tags JSON` | metadata mutation | Converges the run's tags to the supplied JSON, setting changed keys and removing stale ones |
 | `--storage-type` / `--storage-capacity` | `--start-run` | Omit type for AWS's preferred DYNAMIC; capacity requires STATIC |
 | `--cache-id` / `--cache-behavior` | `--start-run` | Reuse task results from a run cache |
 | `--run-group-id` | `--start-run` | Concurrency and cost caps |
@@ -284,7 +311,7 @@ step.
 ## Provenance
 
 - Transport: **boto3** (AWS HealthOmics API directly).
-- Allow-listed operations: 9 of 107 available.
+- Allow-listed operations: 18 of 107 available.
 
 This run executed in AWS HealthOmics. Replaying it requires the same account,
 execution role and container images.
@@ -296,20 +323,27 @@ execution role and container images.
 output_directory/
 ├── report.md
 ├── result.json
+├── outputs.json       # when outputs were verified or downloaded
+├── handoff.json       # suggested downstream ClawBio skills for local outputs
+├── params.template.json # --params-template only
 ├── tables/
-│   └── tasks.csv        # --run-status; runs.csv / workflows.csv for list modes
+│   └── tasks.csv        # --run-status; mode-specific CSVs otherwise
 └── reproducibility/
     ├── commands.sh
     ├── environment.yml
+    ├── replay_manifest.json
     └── checksums.sha256
 ```
 
 The table is named for what the report is about: `tasks.csv` for a run,
 `runs.csv` for `--list-runs`, `workflows.csv` for `--list-workflows`,
 `outputs.csv` when `--verify-outputs` ran, `uploads.csv` / `downloads.csv` for
-transfers, and `definition.csv` plus `workflow.zip` for `--register`. Exactly
-one table is written, so check the mode rather than assuming `tasks.csv`
-exists.
+transfers, `checks.csv` for `--check`, `params-template.csv` for
+`--params-template`, and `definition.csv` plus `workflow.zip` for `--register`.
+Exactly one table is written, so check the mode rather than assuming
+`tasks.csv` exists. `replay_manifest.json` records the mode, region, run id,
+workflow id/version and request id where available; `commands.sh` checks that
+manifest before replaying.
 
 ## Dependencies
 
@@ -327,43 +361,13 @@ environment or instance role; this skill never reads, stores or forwards them.
 - Both gates are covered by tests asserting `StartRun` is never reached.
 - `requestId` derivation is tested for stability and for changing when the
   submission changes.
-- **Exercised against a live AWS account.**
-  `tests/test_live_integration.py` (opt-in via `CLAWBIO_RUN_LIVE_HEALTHOMICS=1`)
-  reads `StartRun`'s required members and `workflowType`'s enum out of
-  botocore's own service model, so an AWS contract change fails at test time
-  rather than at submission time. It also lists Ready2Run workflows live and
-  asserts nothing credential-shaped reaches the bundle. Every test in that file
-  is read-only and costs nothing.
-- **One real Ready2Run run submitted end to end** (ESMFold, fixed price
-  $0.25). AWS recorded `workflowType: READY2RUN` and both run tags on the run
-  resource, confirmed against AWS rather than inferred from the service model.
-- **One real PRIVATE workflow registered and submitted end to end**: a minimal
-  WDL, containerised, submitted with `--start-run --workflow-type PRIVATE
-  --wait`, reached `COMPLETED`, and its output file was read back from S3
-  containing the exact string passed in as a parameter. Two real failures were
-  hit and fixed along the way (see Gotchas: architecture mismatch, ECR
-  repository policy) — both surfaced through this skill's own reporting, not
-  through the AWS CLI or console.
-- **A rejected submission raises rather than returning data.** A deliberate
-  first attempt with an input the execution role could not read produced a
-  `ValidationException` that propagated as an exception and billed nothing —
-  botocore raises, so a rejected submission cannot be mistaken for data.
-- **A FAILED run's own reason, and its failing task's reason, both confirmed
-  live.** The private-workflow run above failed twice before it succeeded;
-  both failures rendered their real AWS-supplied message in `report.md`,
-  including the task-level `GetRunTask` enrichment this section exists to
-  document.
-- **The full loop, executed live through this skill alone**: a local file
-  uploaded to S3, a WDL registered as a private workflow (reaching `ACTIVE`),
-  a run submitted and watched to `COMPLETED`, and its outputs downloaded and
-  hashed. The downloaded file contained the exact string passed in as a
-  parameter, and an independent `shasum -a 256` matched the SHA-256 the skill
-  reported. No AWS CLI call was involved in any of those steps.
-- **Live testing caught two defects the offline tests could not.** Deep
-  verification counted a zero-byte S3 directory marker as a missing output, so
-  a complete run reported itself incomplete; and an internal key collision let
-  a boolean status overwrite the list of uploaded files. Both are fixed and
-  pinned by tests.
+- `tests/test_live_integration.py` is opt-in
+  (`CLAWBIO_RUN_LIVE_HEALTHOMICS=1`) and read-only. It checks the botocore
+  service model for allowlisted operation drift, `StartRun` required members,
+  and `workflowType` enum support.
+- Real-account evidence in [EXAMPLE.md](EXAMPLE.md) covers a Ready2Run run, a
+  private WDL registration/run, output verification, and failure-message
+  surfacing without AWS CLI handoffs.
 
 ## Gotchas
 

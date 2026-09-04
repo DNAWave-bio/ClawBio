@@ -442,6 +442,7 @@ MVP_FOLDERS = {
     "profile-report", "bio-orchestrator", "claw-ancestry-pca",
     "ukb-navigator", "galaxy-bridge", "rnaseq-de", "diff-visualizer",
     "bioconductor-bridge",
+    "healthomics-bridge",
     "sample-qc-triage",
     "crispr-screen-triage",
     "marker-dominance-mapper",

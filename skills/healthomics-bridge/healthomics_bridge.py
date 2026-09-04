@@ -5,7 +5,7 @@ Talks to the HealthOmics API directly, behind an allow-listed client, a
 fail-closed egress gate and a cost gate on submission. The allowlist is the
 point: boto3 exposes all 107 ``omics`` operations, and an agent handed that
 surface can delete a run, cancel in-flight work, or mutate shared account
-configuration as easily as it can list runs. Seven operations are reachable
+configuration as easily as it can list runs. A narrow set of operations is reachable
 here; destruction and shared-config mutation are barred by name and no flag
 unlocks them.
 
@@ -54,6 +54,10 @@ from clawbio.common.report import (  # noqa: E402
 )
 from clawbio.common.textio import write_text_lf  # noqa: E402
 from healthomics_pricing import estimated_cost_line  # noqa: E402
+import error_codes as _error_codes  # noqa: E402
+import params_template as _params_template  # noqa: E402
+import preflight as _preflight  # noqa: E402
+import recommendations as _recommendations  # noqa: E402
 import registration as _registration  # noqa: E402
 import s3_client as _s3  # noqa: E402
 from omics_client import (  # noqa: E402
@@ -334,7 +338,7 @@ def _enrich_failed_tasks(*, client: OmicsClient, run_id: str, tasks: list[dict[s
             detail = client.call("GetRunTask", id=str(run_id), taskId=str(task_id))
         except Exception:
             continue
-        for field in ("statusMessage", "failureReason"):
+        for field in ("statusMessage", "failureReason", "logStream"):
             if detail.get(field):
                 task[field] = detail[field]
 
@@ -519,6 +523,7 @@ def register_run_workflow(
         "definition_path": str(definition), "zip": manifest,
         "name_collisions": collisions, "registered": False,
         "workflow_id": None, "workflow_status": None,
+        "workflow_status_message": None,
     }
 
     if not confirmed:
@@ -536,8 +541,147 @@ def register_run_workflow(
     base.update({
         "registered": True, "workflow_id": workflow_id,
         "workflow_status": str(workflow.get("status", "")).upper(),
+        # AWS's own explanation, not a guess. The same field this skill
+        # already reads for a failed run and a failed task -- registration
+        # discarded it after polling until a live FAILED registration exposed
+        # that the report was printing a generic hint instead.
+        "workflow_status_message": workflow.get("statusMessage"),
     })
     return base
+
+
+def register_workflow_version(
+    *, client: OmicsClient, workflow_id: str, definition: Path,
+    additional_files: list[Path], version_name: str, description: str | None,
+    parameter_template: dict[str, Any] | None, confirmed: bool, output_dir: Path,
+) -> dict[str, Any]:
+    """Add a version to an EXISTING workflow, rather than creating a new one.
+
+    --start-run has always accepted --workflow-version-name; there was no path
+    that could ever create the version it names. Reuses the same reproducible
+    archive machinery as --register -- the same honesty about what the digest
+    proves, and the same inability to lint before AWS validates server-side.
+    """
+    definition = Path(definition).expanduser().resolve()
+    resolved_engine = _registration.resolve_engine(definition, None)
+    members = _registration.resolve_zip_members(definition, list(additional_files))
+    manifest = _registration.build_definition_zip(
+        members=members,
+        destination=Path(output_dir) / "tables" / f"workflow-version-{version_name}.zip")
+
+    request_id = hashlib.sha256(
+        f"{workflow_id}:{version_name}:{manifest['sha256']}".encode("utf-8")
+    ).hexdigest()[:32]
+    request: dict[str, Any] = {
+        "workflowId": workflow_id, "versionName": version_name,
+        "definitionZip": Path(manifest["path"]).read_bytes(), "requestId": request_id,
+    }
+    if description:
+        request["description"] = description
+    if parameter_template:
+        request["parameterTemplate"] = parameter_template
+
+    base: dict[str, Any] = {
+        "mode": "register-version", "workflow_id": workflow_id,
+        "version_name": version_name, "engine": resolved_engine,
+        "definition_path": str(definition), "zip": manifest,
+        "registered": False, "version_status": None, "version_status_message": None,
+    }
+    if not confirmed:
+        print(
+            "DRY RUN: no workflow version was created. Re-run with "
+            "--confirm-register to create it.",
+            file=sys.stderr,
+        )
+        return base
+
+    client.call("CreateWorkflowVersion", **request)
+    version = client.call(
+        "GetWorkflowVersion", workflowId=workflow_id, versionName=version_name)
+    base.update({
+        "registered": True,
+        "version_status": str(version.get("status", "")).upper(),
+        "version_status_message": version.get("statusMessage"),
+    })
+    return base
+
+
+def describe_run_group(*, client: OmicsClient, group_id: str) -> dict[str, Any]:
+    """One run group's own detail -- concurrency and cost limits --
+    so --start-run --run-group-id is not a blind reference to an id you
+    listed but never actually looked at."""
+    return client.call("GetRunGroup", id=str(group_id))
+
+
+def describe_run_cache(*, client: OmicsClient, cache_id: str) -> dict[str, Any]:
+    """One run cache's own detail, for the same reason as describe_run_group."""
+    return client.call("GetRunCache", id=str(cache_id))
+
+
+def tag_run(*, client: OmicsClient, run_id: str, tags: dict[str, str]) -> dict[str, Any]:
+    """Set tags on a run after submission.
+
+    ListTagsForResource had no write-side pair: tags were settable only at
+    --start-run time, with no way back to correct or add them afterward.
+    """
+    run = client.call("GetRun", id=str(run_id))
+    arn = run.get("arn")
+    if not arn:
+        raise OmicsCallError(f"Run {run_id} has no arn to tag.")
+    client.call("TagResource", resourceArn=str(arn), tags=tags)
+    return {"mode": "tag", "run_id": run_id, "tagged": tags, "arn": arn}
+
+
+def list_run_tags(*, client: OmicsClient, run_id: str) -> dict[str, Any]:
+    """Read one run's tags through the same resource ARN AWS mutates."""
+    run = client.call("GetRun", id=str(run_id))
+    arn = run.get("arn")
+    if not arn:
+        raise OmicsCallError(f"Run {run_id} has no arn to list tags.")
+    tags = dict(client.call("ListTagsForResource", resourceArn=str(arn)).get("tags", {}))
+    return {"mode": "tags", "run_id": run_id, "tags": tags, "arn": arn}
+
+
+def sync_run_tags(
+    *, client: OmicsClient, run_id: str, desired_tags: dict[str, str]
+) -> dict[str, Any]:
+    """Converge a run's tags to a desired JSON object.
+
+    This is intentionally narrow: it reads current run tags, sets changed keys,
+    and removes keys absent from the desired set. It never touches account-level
+    tagging configuration.
+    """
+    run = client.call("GetRun", id=str(run_id))
+    arn = run.get("arn")
+    if not arn:
+        raise OmicsCallError(f"Run {run_id} has no arn to sync tags.")
+    current = dict(client.call("ListTagsForResource", resourceArn=str(arn)).get("tags", {}))
+    to_set = {k: v for k, v in desired_tags.items() if current.get(k) != v}
+    to_remove = sorted(set(current) - set(desired_tags))
+    if to_set:
+        client.call("TagResource", resourceArn=str(arn), tags=to_set)
+    if to_remove:
+        client.call("UntagResource", resourceArn=str(arn), tagKeys=to_remove)
+    return {
+        "mode": "sync-tags",
+        "run_id": run_id,
+        "arn": arn,
+        "previous_tags": current,
+        "desired_tags": desired_tags,
+        "set": to_set,
+        "removed": to_remove,
+        "tags": desired_tags,
+    }
+
+
+def untag_run(*, client: OmicsClient, run_id: str, keys: list[str]) -> dict[str, Any]:
+    """Remove tags from a run by key."""
+    run = client.call("GetRun", id=str(run_id))
+    arn = run.get("arn")
+    if not arn:
+        raise OmicsCallError(f"Run {run_id} has no arn to untag.")
+    client.call("UntagResource", resourceArn=str(arn), tagKeys=keys)
+    return {"mode": "untag", "run_id": run_id, "untagged": keys, "arn": arn}
 
 
 def fetch_run_bundle(*, client: OmicsClient, run_id: str) -> dict[str, Any]:
@@ -658,6 +802,57 @@ def map_list_report(
     }
 
 
+def map_check_report(preflight_result: dict[str, Any], *, region: str) -> dict[str, Any]:
+    """Turn preflight checks into the shared reported shape."""
+    data = _pad_transfer_report(
+        {
+            **preflight_result,
+            "region": region,
+            "items": list(preflight_result.get("checks") or []),
+            "n_items": int(preflight_result.get("n_checks", 0)),
+        },
+        region,
+    )
+    data["mode"] = "check"
+    return data
+
+
+def map_workflow_search_report(
+    *, query: str, items: list[dict[str, Any]], kind: str, region: str
+) -> dict[str, Any]:
+    """Search/recommendation reports are workflow listings with scores."""
+    data = map_list_report(items, kind=kind, region=region)
+    data["query"] = query
+    return data
+
+
+def map_params_template_report(payload: dict[str, Any], *, region: str) -> dict[str, Any]:
+    """Parameter-template report shape."""
+    params = payload.get("params") or {}
+    template = payload.get("parameter_template") or {}
+    rows = [
+        {
+            "name": name,
+            "default": json.dumps(default, sort_keys=True),
+            "template": json.dumps(template.get(name, {}), sort_keys=True),
+        }
+        for name, default in sorted(params.items())
+    ]
+    return _pad_transfer_report(
+        {
+            "mode": "params-template",
+            "workflow_id": payload.get("workflow_id"),
+            "workflow_name": payload.get("workflow_name"),
+            "workflow_type": payload.get("workflow_type"),
+            "parameter_template": template,
+            "params_template": params,
+            "items": rows,
+            "n_items": len(rows),
+        },
+        region,
+    )
+
+
 def _transfer_markdown(data: dict[str, Any]) -> str:
     """Report for the modes that move bytes or create a workflow."""
     mode = data["mode"]
@@ -745,12 +940,16 @@ def _transfer_markdown(data: dict[str, Any]) -> str:
             lines += ["", f"## Workflow created — status `{status}`", ""]
             lines.append(f"- **Workflow id**: `{data['workflow_id']}`")
             if status == "FAILED":
-                lines.append(
-                    "\n**This workflow failed to register and cannot be run.** "
-                    "AWS validates the definition server-side — there is no lint "
-                    "API to catch this earlier — so check that the entrypoint "
-                    "filename matches what the engine expects."
-                )
+                reason = data.get("workflow_status_message")
+                lines.append("\n**This workflow failed to register and cannot be run.**")
+                if reason:
+                    lines.append(f"\nAWS's own reason: {reason}")
+                else:
+                    lines.append(
+                        "\nAWS validates the definition server-side — there is no "
+                        "lint API to catch this earlier — so check that the "
+                        "entrypoint filename matches what the engine expects."
+                    )
             else:
                 lines.append(
                     f"\nRun it with:\n\n```bash\n--start-run {data['workflow_id']} "
@@ -772,6 +971,181 @@ def _transfer_markdown(data: dict[str, Any]) -> str:
             )
 
     lines += ["", "## Provenance", ""] + _provenance_lines(data)
+    lines += ["", generate_report_footer().strip(), ""]
+    return "\n".join(lines)
+
+
+def _tag_markdown(data: dict[str, Any]) -> str:
+    """Report for tag read/write modes."""
+    labels = {
+        "tag": "Tagged",
+        "untag": "Untagged",
+        "tags": "Tags",
+        "sync-tags": "Synced Tags",
+    }
+    verb = labels[data["mode"]]
+    header = generate_report_header(
+        title=f"AWS HealthOmics — Run {verb}",
+        skill_name=SKILL_NAME, skill_version=SKILL_VERSION,
+        extra_metadata={"Mode": verb, "Region": data["region"]},
+    )
+    lines = [header, "", f"## {verb}", ""]
+    lines.append(f"**Run**: `{data['run_id']}` (`{data['arn']}`)")
+    if data["mode"] == "tag":
+        rendered = ", ".join(f"`{k}={v}`" for k, v in sorted(data["tagged"].items()))
+        lines.append(f"\nSet: {rendered}")
+    elif data["mode"] == "untag":
+        lines.append(f"\nRemoved: {', '.join(f'`{k}`' for k in data['untagged'])}")
+    elif data["mode"] == "sync-tags":
+        if data.get("set"):
+            rendered = ", ".join(f"`{k}={v}`" for k, v in sorted(data["set"].items()))
+            lines.append(f"\nSet/updated: {rendered}")
+        if data.get("removed"):
+            lines.append(f"\nRemoved: {', '.join(f'`{k}`' for k in data['removed'])}")
+        if not data.get("set") and not data.get("removed"):
+            lines.append("\nNo changes were needed.")
+    tags = data.get("tags") or data.get("desired_tags") or data.get("tagged") or {}
+    if tags:
+        lines += ["", "| Key | Value |", "|---|---|"]
+        for key, value in sorted(tags.items()):
+            lines.append(f"| `{key}` | `{value}` |")
+    lines += ["", generate_report_footer().strip(), ""]
+    return "\n".join(lines)
+
+
+def _register_version_markdown(data: dict[str, Any]) -> str:
+    """Report for adding a version to an existing workflow."""
+    acted = data.get("registered")
+    header = generate_report_header(
+        title="AWS HealthOmics — Workflow Version",
+        skill_name=SKILL_NAME, skill_version=SKILL_VERSION,
+        extra_metadata={
+            "Mode": "Register version" + ("" if acted else " — DRY RUN"),
+            "Region": data["region"],
+        },
+    )
+    zip_manifest = data.get("zip") or {}
+    lines = [header, "", "## Version definition", ""]
+    lines.append(f"- **Workflow id**: `{data['workflow_id']}`")
+    lines.append(f"- **Version name**: `{data['version_name']}`")
+    lines.append(f"- **Engine**: {data['engine']}")
+    lines.append(
+        f"- **Archive**: {zip_manifest.get('n_bytes', 0):,} bytes, "
+        f"`{str(zip_manifest.get('sha256', ''))[:16]}…`"
+    )
+    if acted:
+        status = data.get("version_status")
+        lines += ["", f"## Version created — status `{status}`", ""]
+        if status == "FAILED":
+            reason = data.get("version_status_message")
+            lines.append("\n**This version failed to register.**")
+            if reason:
+                lines.append(f"\nAWS's own reason: {reason}")
+        else:
+            lines.append(
+                f"\nRun it with `--start-run {data['workflow_id']} "
+                f"--workflow-version-name {data['version_name']} ...`"
+            )
+    else:
+        lines += ["", "## Nothing was created.", ""]
+        lines.append("Re-run with `--confirm-register` to create this version.")
+    lines += ["", generate_report_footer().strip(), ""]
+    return "\n".join(lines)
+
+
+def _check_markdown(data: dict[str, Any]) -> str:
+    """Report for --check."""
+    header = generate_report_header(
+        title="AWS HealthOmics — Preflight",
+        skill_name=SKILL_NAME,
+        skill_version=SKILL_VERSION,
+        extra_metadata={"Mode": "Preflight", "Region": data["region"]},
+    )
+    lines = [header, "", "## Checks", ""]
+    lines.append(
+        f"{data.get('n_checks', 0)} check(s): "
+        f"{data.get('n_failed', 0)} failed, {data.get('n_warnings', 0)} warning(s)."
+    )
+    lines += ["", "| Check | Result | Severity | Detail |", "|---|---|---|---|"]
+    for check in data.get("checks", []):
+        result = "PASS" if check.get("ok") else "FAIL"
+        lines.append(
+            f"| `{check.get('name', '')}` | {result} | "
+            f"{check.get('severity', '')} | {check.get('detail', '')} |"
+        )
+    lines += ["", "## Provenance", ""] + _provenance_lines(data)
+    lines += ["", generate_report_footer().strip(), ""]
+    return "\n".join(lines)
+
+
+def _workflow_search_markdown(data: dict[str, Any]) -> str:
+    """Report for workflow search and recommendation."""
+    title = (
+        "AWS HealthOmics — Workflow Recommendations"
+        if data["mode"] == "workflow-recommendations"
+        else "AWS HealthOmics — Workflow Search"
+    )
+    header = generate_report_header(
+        title=title,
+        skill_name=SKILL_NAME,
+        skill_version=SKILL_VERSION,
+        extra_metadata={"Mode": data["mode"], "Region": data["region"]},
+    )
+    lines = [header, "", f"## Query", "", f"`{data.get('query', '')}`", ""]
+    lines.append(f"{data.get('n_items', 0)} workflow(s) matched.")
+    lines += ["", "| Score | Id | Name | Status | Type |", "|---|---|---|---|---|"]
+    for item in data.get("items", []):
+        lines.append(
+            f"| {item.get('matchScore', '')} | `{item.get('id', 'n/a')}` | "
+            f"{item.get('name', 'n/a')} | {item.get('status', 'n/a')} | "
+            f"{item.get('type', item.get('workflowType', 'n/a'))} |"
+        )
+    if data.get("items"):
+        first = data["items"][0]
+        lines += [
+            "",
+            "## Next step",
+            "",
+            "Generate a params skeleton before submitting:",
+            "",
+            "```bash",
+            f"--params-template {first.get('id', '<workflow-id>')} "
+            f"--workflow-type {first.get('type', first.get('workflowType', 'PRIVATE'))}",
+            "```",
+        ]
+    lines += ["", "## Provenance", ""] + _provenance_lines(data)
+    lines += ["", generate_report_footer().strip(), ""]
+    return "\n".join(lines)
+
+
+def _params_template_markdown(data: dict[str, Any]) -> str:
+    """Report for --params-template."""
+    header = generate_report_header(
+        title="AWS HealthOmics — Params Template",
+        skill_name=SKILL_NAME,
+        skill_version=SKILL_VERSION,
+        extra_metadata={"Mode": "Params template", "Region": data["region"]},
+    )
+    lines = [header, "", "## Workflow", ""]
+    lines += [
+        f"- **Workflow id**: `{data.get('workflow_id', 'n/a')}`",
+        f"- **Workflow name**: {data.get('workflow_name', 'n/a')}",
+        f"- **Workflow type**: {data.get('workflow_type', 'n/a')}",
+    ]
+    lines += ["", "## Parameters", ""]
+    if data.get("items"):
+        lines += ["| Name | Default |", "|---|---|"]
+        for item in data["items"]:
+            lines.append(f"| `{item['name']}` | `{item['default']}` |")
+    else:
+        lines.append("No parameter template was exposed for this workflow.")
+    lines += [
+        "",
+        "A writable skeleton is in `params.template.json`; use it as the starting params file and fill in real S3/local values before `--start-run`.",
+        "",
+        "## Provenance",
+        "",
+    ] + _provenance_lines(data)
     lines += ["", generate_report_footer().strip(), ""]
     return "\n".join(lines)
 
@@ -798,9 +1172,10 @@ def _verification_lines(data: dict[str, Any]) -> list[str]:
 
     if deep:
         if verification.get("complete"):
+            downloaded_to = verification.get("downloaded_to", "the requested destination")
             lines.append(
                 f"\nEvery listed object was downloaded to "
-                f"`{verification['downloaded_to']}` and hashed. The SHA-256 values "
+                f"`{downloaded_to}` and hashed. The SHA-256 values "
                 f"below are real checksums of the bytes on disk."
             )
         else:
@@ -889,11 +1264,32 @@ def _provenance_lines(data: dict[str, Any]) -> list[str]:
     ]
 
 
+_LIST_MODES = {
+    "runs",
+    "workflows",
+    "run-groups",
+    "run-caches",
+    "workflow-versions",
+    "workflow-search",
+    "workflow-recommendations",
+}
+
+
 def _report_markdown(data: dict[str, Any]) -> str:
-    if data.get("mode") in {"runs", "workflows"}:
+    if data.get("mode") == "check":
+        return _check_markdown(data)
+    if data.get("mode") in {"workflow-search", "workflow-recommendations"}:
+        return _workflow_search_markdown(data)
+    if data.get("mode") == "params-template":
+        return _params_template_markdown(data)
+    if data.get("mode") in _LIST_MODES:
         return _list_markdown(data)
     if data.get("mode") in {"upload", "download", "register"}:
         return _transfer_markdown(data)
+    if data.get("mode") in {"tag", "untag", "tags", "sync-tags"}:
+        return _tag_markdown(data)
+    if data.get("mode") == "register-version":
+        return _register_version_markdown(data)
 
     run = data["run"]
     workflow = data["workflow"]
@@ -944,6 +1340,17 @@ def _report_markdown(data: dict[str, Any]) -> str:
             reason = task.get("statusMessage") or task.get("failureReason")
             if reason:
                 lines.append(f"  - {reason}")
+            # Fetched by _enrich_failed_tasks and previously discarded: the log
+            # location is the next thing a user reading this section needs.
+            log_stream = task.get("logStream")
+            if log_stream:
+                group, _, stream = log_stream.partition(":log-stream:")
+                group_name = group.split(":log-group:")[-1] if ":log-group:" in group else group
+                lines.append(f"  - Logs: `{log_stream}`")
+                lines.append(
+                    f"    ```bash\n    aws logs get-log-events "
+                    f"--log-group-name {group_name} --log-stream-name {stream}\n    ```"
+                )
 
     if data.get("start_run_request") is not None:
         lines += ["", "## Submission", ""]
@@ -984,8 +1391,19 @@ def _report_markdown(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+_LIST_TITLES = {
+    "runs": "AWS HealthOmics Runs",
+    "workflows": "AWS HealthOmics Workflows",
+    "run-groups": "AWS HealthOmics Run Groups",
+    "run-caches": "AWS HealthOmics Run Caches",
+    "workflow-versions": "AWS HealthOmics Workflow Versions",
+    "workflow-search": "AWS HealthOmics Workflow Search",
+    "workflow-recommendations": "AWS HealthOmics Workflow Recommendations",
+}
+
+
 def _list_markdown(data: dict[str, Any]) -> str:
-    title = "AWS HealthOmics Runs" if data["mode"] == "runs" else "AWS HealthOmics Workflows"
+    title = _LIST_TITLES[data["mode"]]
     header = generate_report_header(
         title=title,
         skill_name=SKILL_NAME,
@@ -1013,6 +1431,13 @@ def _list_markdown(data: dict[str, Any]) -> str:
 # both -- see _write_table.
 _RUN_FIELDS = ("id", "name", "status", "workflowId", "creationTime", "stopTime")
 _WORKFLOW_FIELDS = ("id", "name", "status", "type", "creationTime")
+_WORKFLOW_SEARCH_FIELDS = ("id", "name", "status", "type", "matchScore", "creationTime")
+_RUN_GROUP_FIELDS = ("id", "name", "maxCpus", "maxRuns", "maxDuration")
+_RUN_CACHE_FIELDS = ("id", "name", "status", "cacheS3Uri")
+_WORKFLOW_VERSION_FIELDS = ("workflowId", "versionName", "status", "creationTime")
+_CHECK_FIELDS = ("name", "ok", "severity", "detail")
+_PARAMETER_FIELDS = ("name", "default", "template")
+_TAG_FIELDS = ("key", "value")
 
 
 def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]) -> Path:
@@ -1066,17 +1491,43 @@ def _write_table(output_dir: Path, data: dict[str, Any]) -> Path:
         return _write_csv(
             output_dir / "tables" / "workflows.csv", _WORKFLOW_FIELDS, data["items"]
         )
+    if mode in {"workflow-search", "workflow-recommendations"}:
+        return _write_csv(
+            output_dir / "tables" / "workflows.csv", _WORKFLOW_SEARCH_FIELDS,
+            data["items"],
+        )
+    if mode == "run-groups":
+        return _write_csv(output_dir / "tables" / "run-groups.csv",
+                          _RUN_GROUP_FIELDS, data["items"])
+    if mode == "run-caches":
+        return _write_csv(output_dir / "tables" / "run-caches.csv",
+                          _RUN_CACHE_FIELDS, data["items"])
+    if mode == "workflow-versions":
+        return _write_csv(output_dir / "tables" / "workflow-versions.csv",
+                          _WORKFLOW_VERSION_FIELDS, data["items"])
     if mode == "upload":
         return _write_csv(output_dir / "tables" / "uploads.csv", _UPLOAD_FIELDS,
                           data.get("uploaded_files", []))
     if mode == "download":
         return _write_csv(output_dir / "tables" / "downloads.csv",
                           ("key", "path", "etag"), data.get("downloaded_files", []))
-    if mode == "register":
+    if mode in {"register", "register-version"}:
         return _write_csv(
             output_dir / "tables" / "definition.csv", _ZIP_MEMBER_FIELDS,
             (data.get("zip") or {}).get("members", []),
         )
+    if mode == "check":
+        return _write_csv(output_dir / "tables" / "checks.csv", _CHECK_FIELDS,
+                          data.get("checks", []))
+    if mode == "params-template":
+        return _write_csv(output_dir / "tables" / "params-template.csv",
+                          _PARAMETER_FIELDS, data.get("items", []))
+    if mode in {"tag", "untag", "tags", "sync-tags"}:
+        tags = data.get("tags") or data.get("desired_tags") or data.get("tagged") or {}
+        rows = [{"key": key, "value": value} for key, value in sorted(tags.items())]
+        if mode == "untag":
+            rows = [{"key": key, "value": ""} for key in data.get("untagged", [])]
+        return _write_csv(output_dir / "tables" / "tags.csv", _TAG_FIELDS, rows)
     if data.get("verification"):
         return _write_csv(
             output_dir / "tables" / "outputs.csv", _OUTPUT_FIELDS,
@@ -1091,6 +1542,178 @@ def _warn_before_overwrite(output_dir: Path) -> None:
             f"WARNING: {output_dir} already exists and is not empty; files may be overwritten.",
             file=sys.stderr,
         )
+
+
+def _replay_args(mode: str | None, data: dict[str, Any]) -> list[Any]:
+    """The flags that reproduce this bundle's own mode.
+
+    Every non-run mode used to fall through to ``["--run-status", ""]`` --
+    upload, download, register, and the newer tag/untag/register-version modes
+    all replay a run-status query for a run that was never named. Real
+    bundles from this session (an upload, a registration) both shipped that
+    broken command. One switch per mode, so a new mode that forgets to extend
+    this fails loudly (KeyError) rather than silently inheriting the wrong
+    replay.
+    """
+    if mode in _LIST_MODES:
+        flags = {
+            "runs": ["--list-runs"],
+            "workflows": ["--list-workflows"],
+            "run-groups": ["--list-run-groups"],
+            "run-caches": ["--list-run-caches"],
+            "workflow-versions": [
+                "--list-workflow-versions",
+                data.get("workflow_id")
+                or (data.get("items") or [{}])[0].get("workflowId")
+                or "",
+            ],
+            "workflow-search": ["--search-workflows", str(data.get("query", ""))],
+            "workflow-recommendations": [
+                "--recommend-workflow",
+                str(data.get("query", "")),
+            ],
+        }[mode]
+        return flags
+    if mode == "check":
+        return ["--check"]
+    if mode == "params-template":
+        return [
+            "--params-template",
+            str(data.get("workflow_id", "")),
+            *_workflow_type_arg(data),
+        ]
+    if mode == "upload":
+        return ["--upload-inputs", *data.get("sources", []), "--to", data["destination"]]
+    if mode == "download":
+        return ["--download-outputs", str(data.get("run_id", "")), "--to", data["destination"]]
+    if mode == "register":
+        return ["--register", data["definition_path"], "--workflow-name", data["workflow_name"]]
+    if mode == "register-version":
+        return ["--register", data["definition_path"], "--workflow-id", data["workflow_id"],
+                "--new-version-name", data["version_name"]]
+    if mode == "tag":
+        return ["--tag-run", str(data["run_id"]), "--tags",
+                json.dumps(data.get("tagged", {}), sort_keys=True)]
+    if mode == "untag":
+        return ["--untag-run", str(data["run_id"]), "--tag-keys",
+                *list(data.get("untagged", []))]
+    if mode == "tags":
+        return ["--list-tags", str(data["run_id"])]
+    if mode == "sync-tags":
+        return ["--sync-tags", str(data["run_id"]), "--tags",
+                json.dumps(data.get("desired_tags", {}), sort_keys=True)]
+    return ["--run-status", str(data["run"].get("id", ""))]
+
+
+def _workflow_type_arg(data: dict[str, Any]) -> list[str]:
+    workflow_type = data.get("workflow_type") or data.get("workflow", {}).get("type")
+    return ["--workflow-type", str(workflow_type)] if workflow_type else []
+
+
+def _replay_preflight_lines(data: dict[str, Any]) -> list[str]:
+    """Minimal replay guard shipped in commands.sh."""
+    mode = data.get("mode") or "run"
+    return [
+        'MANIFEST="$OUTPUT_DIR/reproducibility/replay_manifest.json"',
+        'if [ ! -f "$MANIFEST" ]; then',
+        '  echo "Missing replay manifest: $MANIFEST" >&2',
+        "  exit 1",
+        "fi",
+        f"if ! grep -q '\"mode\": \"{mode}\"' \"$MANIFEST\"; then",
+        f'  echo "Replay manifest does not describe mode {mode}" >&2',
+        "  exit 1",
+        "fi",
+    ]
+
+
+def _handoff_for_path(path: str) -> list[str]:
+    lower = path.lower()
+    if lower.endswith((".vcf", ".vcf.gz", ".bcf")):
+        return ["variant-annotation", "vcf-annotator", "pharmgx-reporter"]
+    if lower.endswith((".h5ad", ".loom", ".mtx", ".mtx.gz")):
+        return ["scrna-orchestrator", "scrna-embedding"]
+    if lower.endswith((".counts.tsv", ".counts.csv", ".tsv", ".csv")):
+        return ["rnaseq-de", "proteomics-de"]
+    if lower.endswith((".bam", ".cram")):
+        return ["seq-wrangler", "multiqc-reporter"]
+    if lower.endswith((".html", ".zip")):
+        return ["multiqc-reporter"]
+    return []
+
+
+def _write_extra_artifacts(output_dir: Path, data: dict[str, Any]) -> list[Path]:
+    """Write richer machine-readable artifacts beside the standard contract."""
+    written: list[Path] = []
+    repro_dir = output_dir / "reproducibility"
+    repro_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "mode": data.get("mode") or "run",
+        "region": data.get("region"),
+        "run_id": data.get("run", {}).get("id") or data.get("run_id"),
+        "workflow_id": data.get("workflow_id") or data.get("run", {}).get("workflowId"),
+        "workflow_version_name": data.get("version_name") or data.get("workflow_version_name"),
+        "request_id": data.get("start_run_request", {}).get("requestId")
+        if isinstance(data.get("start_run_request"), dict) else None,
+        "params_sha256": hashlib.sha256(
+            json.dumps(
+                data.get("start_run_request", {}).get("parameters", {}),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if isinstance(data.get("start_run_request"), dict) else None,
+    }
+    manifest_path = repro_dir / "replay_manifest.json"
+    write_text_lf(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    written.append(manifest_path)
+
+    verification = data.get("verification") or {}
+    outputs_payload: dict[str, Any] | None = None
+    if verification.get("objects") is not None:
+        outputs_payload = {
+            "source": verification.get("source"),
+            "depth": verification.get("depth"),
+            "objects": verification.get("objects", []),
+            "complete": verification.get("complete"),
+        }
+    elif data.get("mode") == "download":
+        outputs_payload = {
+            "source": data.get("source"),
+            "destination": data.get("destination"),
+            "objects": data.get("downloaded_files", []),
+            "complete": not data.get("failures"),
+        }
+    if outputs_payload is not None:
+        path = output_dir / "outputs.json"
+        write_text_lf(path, json.dumps(outputs_payload, indent=2, default=str) + "\n")
+        written.append(path)
+
+        handoff_items = []
+        for entry in outputs_payload.get("objects", []):
+            local_path = entry.get("local_path") or entry.get("path")
+            if not local_path:
+                continue
+            partners = _handoff_for_path(str(local_path))
+            if partners:
+                handoff_items.append({"path": local_path, "suggested_skills": partners})
+        handoff = {
+            "source": outputs_payload.get("source"),
+            "items": handoff_items,
+            "n_items": len(handoff_items),
+        }
+        handoff_path = output_dir / "handoff.json"
+        write_text_lf(handoff_path, json.dumps(handoff, indent=2, default=str) + "\n")
+        written.append(handoff_path)
+
+    if data.get("mode") == "params-template":
+        path = output_dir / "params.template.json"
+        write_text_lf(
+            path,
+            json.dumps(data.get("params_template", {}), indent=2, sort_keys=True) + "\n",
+        )
+        written.append(path)
+
+    return written
 
 
 def write_bundle(
@@ -1114,10 +1737,8 @@ def write_bundle(
 
     mode = data.get("mode")
     table_path = _write_table(output_dir, data)
-    if mode in {"runs", "workflows"}:
-        args: list[Any] = ["--list-runs" if mode == "runs" else "--list-workflows"]
-    else:
-        args = ["--run-status", str(data["run"].get("id", ""))]
+    extra_paths = _write_extra_artifacts(output_dir, data)
+    args: list[Any] = _replay_args(mode, data)
     if data["demo"]:
         args = ["--demo"]
     args += ["--output", ReproPath(output_dir, anchor="output_dir")]
@@ -1131,6 +1752,7 @@ def write_bundle(
                 "Replays the local reporting step. A live replay additionally requires "
                 "the same AWS account and execution role."
             ),
+            preflight=_replay_preflight_lines(data),
         ),
         repo_root=_PROJECT_ROOT,
     )
@@ -1142,12 +1764,47 @@ def write_bundle(
         python_version="3.11",
     )
 
-    if mode in {"runs", "workflows"}:
+    if mode in _LIST_MODES:
         summary = {
             "kind": mode, "n_items": data["n_items"],
             "region": data["region"], "demo": data["demo"],
         }
         status = "LISTED"
+    elif mode == "check":
+        summary = {
+            "kind": "check",
+            "ok": bool(data.get("ok")),
+            "n_checks": data.get("n_checks", 0),
+            "n_failed": data.get("n_failed", 0),
+            "n_warnings": data.get("n_warnings", 0),
+            "region": data["region"],
+            "demo": data["demo"],
+        }
+        status = "OK" if data.get("ok") else "FAILED"
+    elif mode == "params-template":
+        summary = {
+            "kind": "params-template",
+            "workflow_id": data.get("workflow_id"),
+            "n_parameters": data.get("n_items", 0),
+            "region": data["region"],
+            "demo": data["demo"],
+        }
+        status = "TEMPLATE"
+    elif mode in {"tag", "untag", "tags", "sync-tags"}:
+        summary = {
+            "kind": mode,
+            "run_id": data.get("run_id"),
+            "n_tags": len(
+                data.get("tags")
+                or data.get("desired_tags")
+                or data.get("tagged")
+                or data.get("untagged")
+                or {}
+            ),
+            "region": data["region"],
+            "demo": data["demo"],
+        }
+        status = "TAGGED" if mode in {"tag", "sync-tags"} else "TAGS"
     else:
         summary = {
             "run_id": data["run"].get("id"),
@@ -1173,7 +1830,7 @@ def write_bundle(
         ok=True,
     )
     write_checksums(
-        [report_path, result_path, table_path, commands_path, env_path],
+        [report_path, result_path, table_path, commands_path, env_path, *extra_paths],
         output_dir,
         anchor=output_dir,
     )
@@ -1189,6 +1846,16 @@ def run_demo(output_dir: Path) -> dict[str, Any]:
 
 def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     _warn_before_overwrite(output_dir)
+
+    if args.check:
+        params = {}
+        if args.params:
+            params, _ = _preflight.load_params_file(args.params)
+        data = map_check_report(
+            _preflight.run_preflight(args, params=params),
+            region=args.region,
+        )
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
 
     start_run_request: dict[str, Any] | None = None
     if args.start_run:
@@ -1237,6 +1904,65 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
 
     client = OmicsOperations(_boto=build_boto_client(args.region, args.profile))
 
+    if args.search_workflows:
+        filters: dict[str, Any] = {"type": args.workflow_type} if args.workflow_type else {}
+        items = list_all(
+            client=client,
+            operation="ListWorkflows",
+            limit=max(args.limit, 100),
+            **filters,
+        )
+        matches = _recommendations.search_workflows(
+            items, args.search_workflows, limit=args.limit
+        )
+        data = map_workflow_search_report(
+            query=args.search_workflows,
+            items=matches,
+            kind="workflow-search",
+            region=args.region,
+        )
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.recommend_workflow:
+        filters = {"type": args.workflow_type} if args.workflow_type else {}
+        items = list_all(
+            client=client,
+            operation="ListWorkflows",
+            limit=max(args.limit, 100),
+            **filters,
+        )
+        recommendation = _recommendations.recommend_workflows(
+            items, args.recommend_workflow, limit=args.limit
+        )
+        data = map_workflow_search_report(
+            query=args.recommend_workflow,
+            items=recommendation["recommendations"],
+            kind="workflow-recommendations",
+            region=args.region,
+        )
+        data["inferred_domains"] = recommendation["inferred_domains"]
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.params_template:
+        lookup: dict[str, Any] = {"id": str(args.params_template)}
+        if args.workflow_type:
+            lookup["type"] = args.workflow_type
+        if args.workflow_version_name:
+            workflow = client.call(
+                "GetWorkflowVersion",
+                workflowId=str(args.params_template),
+                versionName=args.workflow_version_name,
+            )
+        else:
+            workflow = client.call("GetWorkflow", **lookup)
+        data = map_params_template_report(
+            _params_template.workflow_params_payload(workflow),
+            region=args.region,
+        )
+        if not data.get("workflow_id"):
+            data["workflow_id"] = args.params_template
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
     if args.download_outputs:
         run = client.call("GetRun", id=str(args.download_outputs))
         output_uri = run.get("outputUri")
@@ -1257,12 +1983,69 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
             json.loads(args.parameter_template.read_text(encoding="utf-8"))
             if args.parameter_template else None
         )
-        data = register_run_workflow(
-            client=client, definition=Path(args.register),
-            additional_files=list(args.additional_files), name=args.workflow_name,
-            engine=args.engine, description=args.description,
-            parameter_template=template, allow_duplicate=args.allow_duplicate_name,
-            confirmed=args.confirm_register, output_dir=output_dir)
+        if args.workflow_id:
+            data = register_workflow_version(
+                client=client, workflow_id=args.workflow_id,
+                definition=Path(args.register), additional_files=list(args.additional_files),
+                version_name=args.new_version_name, description=args.description,
+                parameter_template=template, confirmed=args.confirm_register,
+                output_dir=output_dir)
+        else:
+            data = register_run_workflow(
+                client=client, definition=Path(args.register),
+                additional_files=list(args.additional_files), name=args.workflow_name,
+                engine=args.engine, description=args.description,
+                parameter_template=template, allow_duplicate=args.allow_duplicate_name,
+                confirmed=args.confirm_register, output_dir=output_dir)
+        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+                            warn_before_overwrite=False)
+
+    if args.list_run_groups:
+        items = list_all(client=client, operation="ListRunGroups", limit=args.limit)
+        data = map_list_report(items, kind="run-groups", region=args.region)
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.list_run_caches:
+        items = list_all(client=client, operation="ListRunCaches", limit=args.limit)
+        data = map_list_report(items, kind="run-caches", region=args.region)
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.list_workflow_versions:
+        items = list_all(client=client, operation="ListWorkflowVersions",
+                         limit=args.limit, workflowId=args.list_workflow_versions)
+        data = map_list_report(items, kind="workflow-versions", region=args.region)
+        data["workflow_id"] = args.list_workflow_versions
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.describe_run_group:
+        group = describe_run_group(client=client, group_id=args.describe_run_group)
+        data = map_list_report([group], kind="run-groups", region=args.region)
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.describe_run_cache:
+        cache = describe_run_cache(client=client, cache_id=args.describe_run_cache)
+        data = map_list_report([cache], kind="run-caches", region=args.region)
+        return write_bundle(output_dir, data, warn_before_overwrite=False)
+
+    if args.tag_run:
+        tags = json.loads(args.tags)
+        data = tag_run(client=client, run_id=args.tag_run, tags=tags)
+        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+                            warn_before_overwrite=False)
+
+    if args.untag_run:
+        data = untag_run(client=client, run_id=args.untag_run, keys=list(args.tag_keys))
+        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+                            warn_before_overwrite=False)
+
+    if args.list_tags:
+        data = list_run_tags(client=client, run_id=args.list_tags)
+        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+                            warn_before_overwrite=False)
+
+    if args.sync_tags:
+        tags = json.loads(args.tags)
+        data = sync_run_tags(client=client, run_id=args.sync_tags, desired_tags=tags)
         return write_bundle(output_dir, _pad_transfer_report(data, args.region),
                             warn_before_overwrite=False)
 
@@ -1332,6 +2115,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--demo", action="store_true", help="Offline demo; no AWS account needed")
+    parser.add_argument("--check", action="store_true",
+                        help="Run read-only preflight checks and exit before any live action")
     parser.add_argument(
         "--output", type=Path, default=Path("output/healthomics"), help="Output directory"
     )
@@ -1347,7 +2132,33 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Download one run's outputs from S3 (gated)")
     mode.add_argument("--register", metavar="DEFINITION",
                       help="Register a WDL/CWL/Nextflow definition as a private "
-                           "workflow (gated). Dry-run without --confirm-register.")
+                           "workflow (gated). Dry-run without --confirm-register. "
+                           "With --workflow-id instead of --workflow-name, adds a "
+                           "version to an existing workflow.")
+    mode.add_argument("--list-run-groups", action="store_true",
+                      help="List run groups referenced by --run-group-id (read-only)")
+    mode.add_argument("--list-run-caches", action="store_true",
+                      help="List run caches referenced by --cache-id (read-only)")
+    mode.add_argument("--describe-run-group", metavar="GROUP_ID",
+                      help="One run group's own detail (read-only)")
+    mode.add_argument("--describe-run-cache", metavar="CACHE_ID",
+                      help="One run cache's own detail (read-only)")
+    mode.add_argument("--list-workflow-versions", metavar="WORKFLOW_ID",
+                      help="List a workflow's versions (read-only)")
+    mode.add_argument("--search-workflows", metavar="QUERY",
+                      help="Search workflows by name, description, id and type")
+    mode.add_argument("--recommend-workflow", metavar="TASK",
+                      help="Recommend workflows for a plain-English task")
+    mode.add_argument("--params-template", metavar="WORKFLOW_ID",
+                      help="Write a starter params.template.json for a workflow")
+    mode.add_argument("--tag-run", metavar="RUN_ID",
+                      help="Set tags on an existing run (gated). Needs --tags.")
+    mode.add_argument("--untag-run", metavar="RUN_ID",
+                      help="Remove tags from a run by key (gated). Needs --tag-keys.")
+    mode.add_argument("--list-tags", metavar="RUN_ID",
+                      help="List tags on a run (read-only)")
+    mode.add_argument("--sync-tags", metavar="RUN_ID",
+                      help="Converge a run's tags to --tags JSON")
 
     parser.add_argument(
         "--workflow-type", choices=["PRIVATE", "READY2RUN"],
@@ -1386,8 +2197,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-duplicate-name", action="store_true",
                         help="Register even though a workflow of this name exists")
     parser.add_argument("--confirm-register", action="store_true",
-                        help="Actually create the workflow. Without it --register "
-                             "is a dry run.")
+                        help="Actually create the workflow (or version). Without "
+                             "it --register is a dry run.")
+    parser.add_argument("--workflow-id", help="Existing workflow id to add a "
+                                              "version to (with --register)")
+    parser.add_argument("--new-version-name",
+                        help="Version name to create (with --register --workflow-id)")
+    parser.add_argument("--tags", help="JSON tags to set (with --tag-run or --sync-tags)")
+    parser.add_argument("--tag-keys", nargs="+", help="Tag keys to remove (with --untag-run)")
     parser.add_argument("--storage-type", choices=["STATIC", "DYNAMIC"],
                         help="Omit to take AWS's preferred DYNAMIC default")
     parser.add_argument("--storage-capacity", type=int,
@@ -1431,6 +2248,74 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _selected_mode(args: argparse.Namespace) -> str:
+    for attr, label in (
+        ("check", "check"),
+        ("list_runs", "runs"),
+        ("list_workflows", "workflows"),
+        ("run_status", "run"),
+        ("start_run", "start-run"),
+        ("upload_inputs", "upload"),
+        ("download_outputs", "download"),
+        ("register", "register"),
+        ("list_run_groups", "run-groups"),
+        ("list_run_caches", "run-caches"),
+        ("describe_run_group", "run-group"),
+        ("describe_run_cache", "run-cache"),
+        ("list_workflow_versions", "workflow-versions"),
+        ("search_workflows", "workflow-search"),
+        ("recommend_workflow", "workflow-recommendations"),
+        ("params_template", "params-template"),
+        ("tag_run", "tag"),
+        ("untag_run", "untag"),
+        ("list_tags", "tags"),
+        ("sync_tags", "sync-tags"),
+    ):
+        if getattr(args, attr, None):
+            return label
+    return "unknown"
+
+
+def _write_error_bundle(output_dir: Path, args: argparse.Namespace, exc: BaseException) -> None:
+    """Best-effort error report with a stable machine-readable code."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = _error_codes.error_payload(
+        exc,
+        mode=_selected_mode(args),
+        region=getattr(args, "region", None),
+    )
+    report = generate_report_header(
+        title="AWS HealthOmics — Error",
+        skill_name=SKILL_NAME,
+        skill_version=SKILL_VERSION,
+        extra_metadata={
+            "Mode": payload["mode"],
+            "Region": payload["region"],
+            "Error code": payload["error_code"],
+        },
+    )
+    report += (
+        f"## Error\n\n`{payload['error_code']}`\n\n{payload['message']}\n\n"
+        + generate_report_footer()
+    )
+    write_text_lf(output_dir / "report.md", report)
+    write_result_json(
+        output_dir=output_dir,
+        skill=SKILL_NAME,
+        version=SKILL_VERSION,
+        summary={
+            "kind": "error",
+            "error_code": payload["error_code"],
+            "mode": payload["mode"],
+            "region": payload["region"],
+        },
+        data=payload,
+        datasets={"AWS HealthOmics": "not reached or failed"},
+        status=payload["error_code"],
+        ok=False,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1441,11 +2326,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result["summary"], indent=2))
         return 0
 
-    if not any([args.list_runs, args.list_workflows, args.run_status, args.start_run,
-                args.upload_inputs, args.download_outputs, args.register]):
+    if not any([args.check, args.list_runs, args.list_workflows, args.run_status, args.start_run,
+                args.upload_inputs, args.download_outputs, args.register,
+                args.list_run_groups, args.list_run_caches, args.describe_run_group,
+                args.describe_run_cache, args.list_workflow_versions,
+                args.search_workflows, args.recommend_workflow, args.params_template,
+                args.tag_run, args.untag_run, args.list_tags, args.sync_tags]):
         parser.error(
-            "choose one of --demo, --list-runs, --list-workflows, --run-status, "
-            "--start-run, --upload-inputs, --download-outputs or --register"
+            "choose one of --demo, --check, --list-runs, --list-workflows, --run-status, "
+            "--start-run, --upload-inputs, --download-outputs, --register, "
+            "--list-run-groups, --list-run-caches, --describe-run-group, "
+            "--describe-run-cache, --list-workflow-versions, --search-workflows, "
+            "--recommend-workflow, --params-template, --tag-run, --untag-run, "
+            "--list-tags or --sync-tags"
         )
 
     # Mode-scoped flags rejected outside their mode, so a misplaced flag is a
@@ -1458,11 +2351,24 @@ def main(argv: list[str] | None = None) -> int:
         ("--parameter-template", args.parameter_template, "--register"),
         ("--allow-duplicate-name", args.allow_duplicate_name, "--register"),
         ("--confirm-register", args.confirm_register, "--register"),
+        ("--workflow-id", args.workflow_id, "--register"),
+        ("--new-version-name", args.new_version_name, "--register"),
         ("--confirm-upload", args.confirm_upload, "--upload-inputs"),
+        ("--tag-keys", args.tag_keys, "--untag-run"),
     ):
-        owned = {"--register": args.register, "--upload-inputs": args.upload_inputs}[owner]
+        owned = {"--register": args.register, "--upload-inputs": args.upload_inputs,
+                 "--tag-run": args.tag_run, "--untag-run": args.untag_run}[owner]
         if value and not owned:
             parser.error(f"{flag} only applies to {owner}")
+
+    if args.tags and not (args.tag_run or args.sync_tags):
+        parser.error("--tags only applies to --tag-run or --sync-tags")
+    if args.tag_run and not args.tags:
+        parser.error("--tag-run requires --tags '{\"key\":\"value\"}'")
+    if args.sync_tags and not args.tags:
+        parser.error("--sync-tags requires --tags '{\"key\":\"value\"}'")
+    if args.untag_run and not args.tag_keys:
+        parser.error("--untag-run requires --tag-keys KEY [KEY ...]")
 
     if args.upload_inputs:
         if not args.to:
@@ -1485,8 +2391,15 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.register:
-        if not args.workflow_name:
-            parser.error("--register requires --workflow-name")
+        if args.workflow_id:
+            if args.workflow_name:
+                parser.error("--register takes --workflow-name (new workflow) or "
+                             "--workflow-id (new version of an existing one), not both")
+            if not args.new_version_name:
+                parser.error("--register --workflow-id requires --new-version-name")
+        elif not args.workflow_name:
+            parser.error("--register requires --workflow-name, or --workflow-id "
+                         "plus --new-version-name to version an existing workflow")
         if not Path(args.register).expanduser().is_file():
             parser.error(f"definition not found: {args.register}")
         for extra in args.additional_files:
@@ -1520,7 +2433,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         result = _run_live(args, output_dir)
-    except (OmicsCallError, EgressRefused, ValueError, OSError, json.JSONDecodeError) as exc:
+    except Exception as exc:
+        try:
+            _write_error_bundle(output_dir, args, exc)
+        except OSError:
+            pass
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

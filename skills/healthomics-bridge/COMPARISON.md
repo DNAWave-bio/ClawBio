@@ -57,7 +57,7 @@ gating matters, and it is the group `healthomics-bridge` belongs to.
 | **Egress gate** | ✅ `--allow-remote-inputs` | ❌ | ❌ | n/a | n/a | n/a |
 | **Action gate** | ✅ four `--confirm-*` flags | ❌ | ❌ | n/a | n/a | n/a |
 | **Cost gate states the cost** | ✅ priced snapshot | n/a | n/a | n/a | n/a | n/a |
-| **Call allowlist** | ✅ 9/107 omics + 3/127 S3 | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Call allowlist** | ✅ 18/107 omics + 3/127 S3 | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Errors raise, never returned as data** | ✅ | ❌ one in-band `{"error": …}` | ✅ | ✅ | ✅ | ✅ |
 | **Retry / backoff configured** | ✅ adaptive, 10 attempts | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **Paginates (follows tokens)** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -66,9 +66,9 @@ gating matters, and it is the group `healthomics-bridge` belongs to.
 | **Repro bundle w/ checksums** | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ |
 | **Verifies its own outputs** | ✅ manifest or real SHA-256 | ❌ | ❌ | ✅ local | n/a | n/a |
 | **Registers a workflow definition** | ✅ WDL / CWL / Nextflow | ❌ runs published tools | ❌ preconfigured | n/a | n/a | n/a |
-| **Tests** | **110** | 51 | 25 | 26 | 45 | 61 |
-| **Python LOC** | 2,329 | 1,913 | 1,540 | 1,303 | 574 | 830 |
-| **SKILL.md lines** | 492 | 224 | 258 | 164 | 289 | 178 |
+| **Tests** | **141** | 51 | 25 | 26 | 45 | 61 |
+| **Python LOC** | 3,541 | 1,913 | 1,540 | 1,303 | 574 | 830 |
+| **SKILL.md lines** | 496 | 224 | 258 | 164 | 289 | 178 |
 
 ## What the table says, honestly
 
@@ -83,7 +83,7 @@ only one where a mistake spends real money in a cloud account someone owns.
 because the consequences differ, not because the other skills are careless.**
 
 **Where the others are better shaped.** `labstep` does its job in 574 lines
-against this skill's 2,329 — a 4× difference for a read-only API needing no
+against this skill's 3,541 — a 6× difference for a read-only API needing no
 gating, no allowlist and no provenance ceiling. `protocols-io` gets 61 tests
 from 830 lines, the best test-to-code density in the group, and is the only
 other skill configuring retry behaviour. Smaller is the correct answer for a
@@ -112,7 +112,7 @@ absence is a reasonable call, not a gap.
 
 ```mermaid
 flowchart TD
-    CLI["CLI — 8 modes"] --> MODE{mode?}
+    CLI["CLI — 21 modes"] --> MODE{mode?}
     MODE -->|--demo| FIX["replay JSON fixture<br/>no boto3, no creds, no network"]
     MODE -->|read-only| PAGE["list_all — follows nextToken<br/>AWS caps maxResults at 100"]
     MODE -->|--upload-inputs| U1{"--allow-remote-inputs?"}
@@ -131,7 +131,7 @@ flowchart TD
     G2 -->|no| STOP["estimate only — bills nothing"]
     G2 -->|yes| CALL
     PAGE --> CALL["OmicsOperations.call"]
-    CALL --> AL{"op in ALLOWED_OPERATIONS?<br/>9 of 107"}
+    CALL --> AL{"op in ALLOWED_OPERATIONS?<br/>18 of 107"}
     AL -->|no| R3["OperationNotAllowed<br/>never reaches AWS"]
     AL -->|yes| BOTO
     S3OP --> SAL{"method in ALLOWED_S3_METHODS?<br/>3 of 127"}
