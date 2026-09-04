@@ -23,12 +23,14 @@ from typing import Any, Protocol
 # work), every Update* (mutates shared config), the sequence/reference store
 # and read-set import/export families, and run group / run cache mutation.
 #
-# CreateWorkflow is absent too, for a different reason: this skill submits runs
-# against workflows that already exist and has no --register mode to reach it.
-# Allow-listing an operation no CLI mode can invoke would overstate this
-# skill's blast radius, so the allowlist holds exactly the operations its code
-# paths actually call — enforced by
-# test_every_allow_listed_operation_is_actually_reachable.
+# CreateWorkflow was previously absent because this skill had no --register
+# mode to reach it, and an allowlist entry no code path can invoke overstates
+# the blast radius. --register now exists, so it is back — gated behind
+# --confirm-register. By the consequence rule it belongs on the allowed side:
+# it creates one cheap, reversible, in-domain resource and bills nothing, which
+# is a smaller consequence than StartRun's, and StartRun is allowed.
+# The allowlist holds exactly the operations code paths actually call, enforced
+# by test_every_allow_listed_operation_is_actually_reachable.
 #
 # GetRunTask *was* dropped on the reasoning that ListRunTasks already returns
 # each task's status, resources and timings. That reasoning missed one field:
@@ -46,6 +48,7 @@ ALLOWED_OPERATIONS = frozenset(
         "ListWorkflows",
         "GetWorkflow",
         "ListTagsForResource",
+        "CreateWorkflow",
         "StartRun",
     }
 )

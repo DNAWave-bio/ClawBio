@@ -91,14 +91,18 @@ uv run python skills/healthomics-bridge/healthomics_bridge.py --demo --output /t
 cat /tmp/ho/report.md
 ```
 
-**With an AWS account** (`uv pip install boto3`), four modes:
+**With an AWS account** (`uv pip install boto3`), the whole loop:
 
 | I want to… | Command |
 |---|---|
 | See my recent runs | `--list-runs --output out/` |
 | See workflows (either type) | `--list-workflows [--workflow-type READY2RUN] --output out/` |
 | Check on one run | `--run-status RUN_ID --output out/` |
+| **Upload a run's inputs** | `--upload-inputs f1 f2 --to s3://bucket/in/ --allow-remote-inputs --confirm-upload` |
+| **Register a WDL/CWL/Nextflow definition** | `--register main.wdl --workflow-name my-wf --confirm-register` |
 | Submit a run | see **Submitting a run** — two steps, not one |
+| **Download a run's outputs** | `--download-outputs RUN_ID --to ./results/ --confirm-download` |
+| **Verify what a run produced** | `--run-status RUN_ID --verify-outputs [deep]` |
 
 **Submitting is two steps on purpose**: run `--start-run` alone first — it builds
 and prints the exact request and bills nothing — then add `--confirm-submit`
@@ -114,6 +118,7 @@ Ready2Run submission fails with a confusing not-found error.
 - "check my omics run"
 - "list my HealthOmics runs"
 - "tag this run for cost allocation"
+- "upload these FASTQs and run my WDL on them"
 
 **Do NOT fire when:**
 
@@ -123,7 +128,6 @@ Ready2Run submission fails with a confusing not-found error.
   not reimplement them.
 - The user wants to run Nextflow locally — use `nfcore-rnaseq-wrapper`,
   `nfcore-sarek-wrapper` or `nfcore-scrnaseq-wrapper`.
-- The user wants to move data to or from S3 — use `aws-s3-bridge`.
 - The user wants a different cloud platform — use `flow-bio` or `illumina-bridge`.
 
 ## Why This Exists
@@ -132,10 +136,13 @@ Ready2Run submission fails with a confusing not-found error.
   no opinion about which are safe, and no record of what it did. `StartRun`
   spends real money and moves a genome into a cloud account; nothing in the
   SDK makes either fact visible beforehand.
-- **With it**: eight allow-listed operations of the 107 boto3 exposes, an
+- **With it**: nine allow-listed operations of the 107 boto3 exposes, an
   egress acknowledgement the user gives out loud, an estimate-first cost gate,
   and an idempotency token so a repeated submission is deduplicated rather
   than billed twice.
+- **The whole loop, not half of it**: inputs up, workflow registered, run
+  submitted and watched, outputs down and checksummed — without dropping to the
+  AWS CLI in the middle.
 - **Why ClawBio**: the specification layer. AWS ships the API; this skill ships
   the constraint, the disclosure and the provenance.
 
@@ -155,15 +162,26 @@ Ready2Run submission fails with a confusing not-found error.
    does not send you to the AWS CLI to see how it went.
 7. **Priced estimates**: a Ready2Run estimate names its flat fee before you
    pass the cost gate.
+8. **Run I/O**: `--upload-inputs` puts a run's inputs in S3 behind both gates;
+   `--download-outputs` brings that run's results back behind one.
+9. **Registration**: `--register` packages a WDL, CWL or Nextflow definition
+   into a reproducible archive and creates a private workflow, gated by
+   `--confirm-register`.
+10. **Output verification**: `--verify-outputs` records what a run actually
+    produced — a cheap listing, or real SHA-256 checksums with `deep`.
 
 ## Scope
 
-**One skill, one task**: the lifecycle of a HealthOmics *run*. It does not
-author workflows, analyse run performance, lint definitions, check containers,
-manage sequence or reference stores, or move data in or out of S3. It never
-calls a destructive operation, changes a permission, or mutates shared account
-configuration — those are barred by name in `omics_client.py` and no flag
-unlocks them.
+**One skill, one task**: the lifecycle of a HealthOmics *run* — which includes
+getting that run's inputs to S3, registering the workflow it executes, and
+bringing its outputs back. It does not analyse run performance, lint
+definitions, check containers, or manage sequence and reference stores.
+
+It is **not a general S3 tool**: S3 access is confined to a run's own input and
+output prefixes. It creates no buckets, sets no bucket or object policies, and
+deletes nothing. Destruction, permission changes and shared-config mutation are
+barred by name in `omics_client.py` and `s3_client.py`, and no flag unlocks
+them.
 
 ## Input Formats
 
@@ -176,7 +194,8 @@ unlocks them.
 ## Workflow
 
 1. **Resolve mode (prescriptive)**: exactly one of `--demo`, `--list-runs`,
-   `--list-workflows`, `--run-status`, `--start-run`.
+   `--list-workflows`, `--run-status`, `--start-run`, `--upload-inputs`,
+   `--download-outputs`, `--register`.
 2. **Short-circuit the demo (prescriptive)**: `--demo` returns before any
    region, credential, network path or boto3 import is touched.
 3. **Gate egress (prescriptive)**: for `--start-run`, refuse without
@@ -202,6 +221,11 @@ unlocks them.
 | `--cache-id` / `--cache-behavior` | `--start-run` | Reuse task results from a run cache |
 | `--run-group-id` | `--start-run` | Concurrency and cost caps |
 | `--wait` | `--start-run`, `--run-status` | Poll to a terminal state; `--poll-interval`, `--wait-timeout-seconds` tune it |
+| `--upload-inputs PATH...` | gated | Needs `--to s3://…`, `--allow-remote-inputs` **and** `--confirm-upload` |
+| `--download-outputs RUN_ID` | gated | Needs `--to DIR` and `--confirm-download`; targets `<outputUri>/<runId>/` only |
+| `--verify-outputs [manifest\|deep]` | `--run-status` | `manifest` lists sizes/ETags and moves nothing; `deep` downloads and hashes (needs `--confirm-download`) |
+| `--register DEFINITION` | gated | Needs `--workflow-name` and `--confirm-register`; `--engine` inferred from `.wdl`/`.cwl`/`.nf` |
+| `--additional-files`, `--description`, `--parameter-template`, `--allow-duplicate-name` | `--register` | Multi-file bundles and workflow metadata |
 | `--region` / `--profile` | all live modes | Default from `AWS_REGION`/`AWS_PROFILE` |
 | `--output` | all modes | Bundle destination |
 
@@ -256,17 +280,10 @@ Evidence below.
 
 2 task(s): 2 completed, 0 failed.
 
-## Fetching the outputs
-
-Outputs stay in S3; this skill holds no S3 credentials. Download them with
-`aws-s3-bridge`, or directly:
-
-    aws s3 cp --recursive s3://my-bucket/output/7049640/ ./run-7049640/
-
 ## Provenance
 
 - Transport: **boto3** (AWS HealthOmics API directly).
-- Allow-listed operations: 8 of 107 available.
+- Allow-listed operations: 9 of 107 available.
 
 This run executed in AWS HealthOmics. Replaying it requires the same account,
 execution role and container images.
@@ -287,8 +304,11 @@ output_directory/
 ```
 
 The table is named for what the report is about: `tasks.csv` for a run,
-`runs.csv` for `--list-runs`, `workflows.csv` for `--list-workflows`. Exactly
-one is written, so check the mode rather than assuming `tasks.csv` exists.
+`runs.csv` for `--list-runs`, `workflows.csv` for `--list-workflows`,
+`outputs.csv` when `--verify-outputs` ran, `uploads.csv` / `downloads.csv` for
+transfers, and `definition.csv` plus `workflow.zip` for `--register`. Exactly
+one table is written, so check the mode rather than assuming `tasks.csv`
+exists.
 
 ## Dependencies
 
@@ -332,6 +352,17 @@ environment or instance role; this skill never reads, stores or forwards them.
   both failures rendered their real AWS-supplied message in `report.md`,
   including the task-level `GetRunTask` enrichment this section exists to
   document.
+- **The full loop, executed live through this skill alone**: a local file
+  uploaded to S3, a WDL registered as a private workflow (reaching `ACTIVE`),
+  a run submitted and watched to `COMPLETED`, and its outputs downloaded and
+  hashed. The downloaded file contained the exact string passed in as a
+  parameter, and an independent `shasum -a 256` matched the SHA-256 the skill
+  reported. No AWS CLI call was involved in any of those steps.
+- **Live testing caught two defects the offline tests could not.** Deep
+  verification counted a zero-byte S3 directory marker as a missing output, so
+  a complete run reported itself incomplete; and an internal key collision let
+  a boolean status overwrite the list of uploaded files. Both are fixed and
+  pinned by tests.
 
 ## Gotchas
 
@@ -379,40 +410,11 @@ environment or instance role; this skill never reads, stores or forwards them.
 - **This skill can start a billable run but cannot stop one.** `CancelRun` is
   barred by name as a destructive operation. Stop a runaway run with
   `aws omics cancel-run --id <id>`.
-- **You will want to build a private workflow's container on Apple Silicon and
-  push it straight to ECR. Don't — HealthOmics only runs `linux/amd64`.** A
-  Mac-native build fails every task with `exec /bin/bash: exec format error`,
-  and that error surfaces from *inside the container*, well past this skill's
-  own gates — the request looked correct, `--confirm-submit` succeeded, and
-  the run still failed. Always `docker buildx build --platform linux/amd64`.
-- **A private submission can fail with `Unable to access image URI... Ensure
-  the ECR private repository... has granted access for the omics service
-  principle`, even though your execution role already has `ecr:BatchGetImage`
-  on that repository.** IAM role permissions and the ECR *repository policy*
-  are two different grants — HealthOmics needs both. The role lets the
-  identity call ECR; the repository policy lets `omics.amazonaws.com` itself
-  reach the repository at all:
-
-  ```json
-  {
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Sid": "AllowHealthOmicsPull",
-      "Effect": "Allow",
-      "Principal": {"Service": "omics.amazonaws.com"},
-      "Action": ["ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage",
-                 "ecr:BatchCheckLayerAvailability"]
-    }]
-  }
-  ```
-
-  `aws ecr set-repository-policy --repository-name <repo> --policy-text file://policy.json`
-  — a permission change, so it is not something this skill does or ever will;
-  see Safety. Verify the image is both correct-architecture and
-  correctly-granted *before* `--confirm-submit`, not after a failed run has
-  already billed for compute that never ran the workload:
-  `aws ecr describe-images` for the manifest's architecture, and
-  `aws ecr get-repository-policy` for the grant.
+- **Building a container for a private workflow?** Two failures are near
+  certain the first time — an Apple Silicon image HealthOmics cannot execute,
+  and an ECR repository policy that does not admit the omics service principal.
+  Both are documented with their exact fixes in
+  [GOTCHAS.md](GOTCHAS.md#containers-for-private-workflows).
 - **A task's own failure reason needs a second call — `ListRunTasks` alone
   does not carry it.** `GetRun`'s `statusMessage` and `ListRunTasks`'
   per-task status are not the same information: the run-level message often
@@ -434,8 +436,21 @@ environment or instance role; this skill never reads, stores or forwards them.
   and shared-config mutation (`Update*`, run group/cache creation) are barred
   outright by name in `PERMANENTLY_EXCLUDED` — no flag unlocks them. Spending
   money (`StartRun`) needs `--confirm-submit`.
-- **Never writes to S3.** It holds no S3 credentials; run outputs stay in S3
-  and the report prints the command to fetch them.
+- **It does write to S3, within one run's own prefixes.** This replaces an
+  earlier, narrower promise ("never writes to S3; holds no S3 credentials"),
+  which stopped being true when upload, download and verification were added.
+  The honest statement now: S3 access is confined to a run's inputs and
+  outputs, gated the same way submission is, and barred by name from bucket
+  creation, policy changes and deletion of anything.
+- **Why S3 at all**: HealthOmics exposes zero output-listing operations —
+  verified against botocore, not assumed. Without S3 access, "what did this run
+  produce?" is unanswerable.
+- **Deep verification is billable.** It downloads every output to hash it, and
+  S3 egress costs money, so it needs `--confirm-download`. `manifest` moves no
+  bytes and costs nothing.
+- **Registration creates a resource that persists.** It bills nothing, but the
+  workflow stays in the account until deleted — and this skill cannot delete
+  it. The report prints the `aws omics delete-workflow` command instead.
 - **Disclaimer**: ClawBio is a research and educational tool. It is not a
   medical device and does not provide clinical diagnoses. Consult a healthcare
   professional before making any medical decisions.
@@ -449,9 +464,10 @@ claim a run succeeded when `summary.run_status` says otherwise.
 
 ## Chaining Partners
 
-- **`aws-s3-bridge`** — upload inputs before a run, download outputs after.
 - **`variant-annotation`**, **`rnaseq-de`**, **`scrna-orchestrator`** — the
-  downstream skills a finished run feeds, once its outputs are local.
+  downstream skills a finished run feeds. `--download-outputs` is what makes
+  that handoff possible: those skills read local files, and a run's results
+  live in S3 until something brings them back.
 
 ## Maintenance
 

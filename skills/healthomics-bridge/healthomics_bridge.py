@@ -54,6 +54,8 @@ from clawbio.common.report import (  # noqa: E402
 )
 from clawbio.common.textio import write_text_lf  # noqa: E402
 from healthomics_pricing import estimated_cost_line  # noqa: E402
+import registration as _registration  # noqa: E402
+import s3_client as _s3  # noqa: E402
 from omics_client import (  # noqa: E402
     ALLOWED_OPERATIONS,
     PERMANENTLY_EXCLUDED,
@@ -337,6 +339,207 @@ def _enrich_failed_tasks(*, client: OmicsClient, run_id: str, tasks: list[dict[s
                 task[field] = detail[field]
 
 
+def run_output_prefix(output_uri: str, run_id: str) -> str:
+    """The S3 prefix holding exactly this run's outputs.
+
+    HealthOmics writes each run under ``<outputUri>/<runId>/``. Pointing at
+    ``<outputUri>`` alone reaches every run the account ever wrote — the same
+    rule the report's fetch command already encodes.
+    """
+    return f"{output_uri.rstrip('/')}/{str(run_id).strip()}/"
+
+
+def upload_run_inputs(
+    *, client: Any, sources: list[Path], destination: str,
+    acknowledged: bool, confirmed: bool,
+) -> dict[str, Any]:
+    """Put a run's inputs in S3, behind the same two gates as a submission.
+
+    ``acknowledged`` records that the user knows data leaves the machine;
+    ``confirmed`` is the separate decision to actually transfer. Uploading puts
+    a genome somewhere it was not before, which is exactly the consequence
+    ``--allow-remote-inputs`` exists to make visible.
+    """
+    resolved = [Path(s).expanduser() for s in sources]
+    if not acknowledged:
+        raise EgressRefused(
+            "This upload would copy local files to S3:\n  "
+            + "\n  ".join(str(p) for p in resolved)
+            + f"\n  -> {destination}"
+            + "\nRe-run with --allow-remote-inputs to acknowledge that genomic "
+            "data will leave this machine."
+        )
+    print(
+        f"WARNING: --allow-remote-inputs is set; {len(resolved)} local file(s) "
+        f"will be copied to {destination}, so genomic data leaves the local machine.",
+        file=sys.stderr,
+    )
+    if not confirmed:
+        print(
+            "ESTIMATE ONLY: nothing was uploaded. Re-run with --confirm-upload "
+            "to transfer.",
+            file=sys.stderr,
+        )
+        return {
+            "mode": "upload", "uploaded": False, "destination": destination,
+            "sources": [str(p) for p in resolved], "uris": [], "n_uploaded": 0,
+        }
+
+    result = _s3.upload_files(client=client, sources=resolved, destination=destination)
+    result.update({"mode": "upload", "uploaded": True,
+                   "sources": [str(p) for p in resolved]})
+    return result
+
+
+def download_run_outputs(
+    *, client: Any, output_uri: str, run_id: str, destination: Path,
+    confirmed: bool,
+) -> dict[str, Any]:
+    """Bring one run's outputs back to this machine.
+
+    One gate, not two. There is no egress acknowledgement because this moves
+    data *toward* the user; gating both directions would make the flag
+    reflexive, and a flag passed on every command stops carrying meaning on the
+    command where it matters.
+    """
+    prefix_uri = run_output_prefix(output_uri, run_id)
+    objects = _s3.list_objects(client=client, uri=prefix_uri)
+    bucket, key_prefix = _s3.parse_s3_uri(prefix_uri)
+
+    if not confirmed:
+        total = sum(o["size"] for o in objects)
+        print(
+            f"ESTIMATE ONLY: {len(objects)} object(s), {total:,} bytes under "
+            f"{prefix_uri}. Nothing was downloaded. Re-run with "
+            f"--confirm-download to transfer (S3 egress is billable).",
+            file=sys.stderr,
+        )
+        return {
+            "mode": "download", "downloaded": False, "source": prefix_uri,
+            "n_objects": len(objects), "n_bytes": total, "n_downloaded": 0,
+            "objects": objects,
+        }
+
+    transferred = _s3.download_objects(
+        client=client, bucket=bucket, objects=objects,
+        key_prefix=key_prefix, destination=Path(destination))
+    transferred.update({"mode": "download", "downloaded": True,
+                        "source": prefix_uri, "n_objects": len(objects)})
+    return transferred
+
+
+def verify_run_outputs(
+    *, client: Any, output_uri: str, run_id: str, depth: str,
+    destination: Path | None, confirmed: bool,
+) -> dict[str, Any]:
+    """Say what a run actually produced, at one of two depths.
+
+    ``manifest`` lists the run's output prefix and records each object's size
+    and ETag. It moves no bytes and costs nothing.
+
+    ``deep`` additionally downloads each object and computes a real SHA-256.
+    That is a genuine checksum the repro bundle can stand behind, and it is the
+    only mode that can prove an output actually exists — which matters because
+    ``write_checksums`` silently skips paths that are missing and so cannot
+    detect an output that never landed.
+    """
+    prefix_uri = run_output_prefix(output_uri, run_id)
+    listed = _s3.list_objects(client=client, uri=prefix_uri)
+
+    objects: list[dict[str, Any]] = []
+    for item in listed:
+        etag = _s3.describe_etag(item.get("etag", ""))
+        objects.append({**item, **etag, "sha256": None})
+
+    result: dict[str, Any] = {
+        "depth": "manifest", "source": prefix_uri, "objects": objects,
+        "n_objects": len(objects), "n_bytes": sum(o["size"] for o in objects),
+        "n_missing": 0, "complete": True, "downloaded_to": None,
+    }
+    if depth != "deep":
+        return result
+
+    bucket, key_prefix = _s3.parse_s3_uri(prefix_uri)
+    target = Path(destination) if destination else Path.cwd() / f"run-{run_id}"
+    transferred = _s3.download_objects(
+        client=client, bucket=bucket, objects=listed,
+        key_prefix=key_prefix, destination=target)
+
+    by_key = {d["key"]: d["path"] for d in transferred["downloaded_files"]}
+    for entry in objects:
+        path = by_key.get(entry["key"])
+        if path and Path(path).is_file():
+            entry["sha256"] = sha256_file(path)
+            entry["local_path"] = path
+
+    missing = [o["key"] for o in objects if not o["sha256"]]
+    result.update({
+        "depth": "deep",
+        "downloaded_to": str(target),
+        "n_missing": len(missing),
+        "missing": missing,
+        "complete": not missing,
+        "failures": transferred["failures"],
+    })
+    return result
+
+
+def register_run_workflow(
+    *, client: OmicsClient, definition: Path, additional_files: list[Path],
+    name: str, engine: str | None, description: str | None,
+    parameter_template: dict[str, Any] | None, allow_duplicate: bool,
+    confirmed: bool, output_dir: Path,
+) -> dict[str, Any]:
+    """Register a definition as a private workflow, gated by --confirm-register.
+
+    The archive is built and checksummed even on a dry run: those bytes are the
+    one piece of this operation the skill can pin honestly, having produced
+    them itself, and seeing the digest before creating anything is the point of
+    a dry run.
+    """
+    definition = Path(definition).expanduser().resolve()
+    resolved_engine = _registration.resolve_engine(definition, engine)
+    members = _registration.resolve_zip_members(definition, list(additional_files))
+    manifest = _registration.build_definition_zip(
+        members=members, destination=Path(output_dir) / "tables" / "workflow.zip")
+
+    collisions = _registration.assert_workflow_name_is_free(
+        client=client, name=name, allow_duplicate=allow_duplicate)
+
+    request_id = hashlib.sha256(
+        f"{name}:{resolved_engine}:{manifest['sha256']}".encode("utf-8")
+    ).hexdigest()[:32]
+    request = _registration.build_create_workflow_request(
+        name=name, engine=resolved_engine, zip_path=Path(manifest["path"]),
+        request_id=request_id, description=description,
+        parameter_template=parameter_template)
+
+    base: dict[str, Any] = {
+        "mode": "register", "workflow_name": name, "engine": resolved_engine,
+        "definition_path": str(definition), "zip": manifest,
+        "name_collisions": collisions, "registered": False,
+        "workflow_id": None, "workflow_status": None,
+    }
+
+    if not confirmed:
+        print(
+            "DRY RUN: no workflow was created. Re-run with --confirm-register "
+            "to create it.",
+            file=sys.stderr,
+        )
+        return base
+
+    created = _registration.register_workflow(client=client, request=request)
+    workflow_id = str(created.get("id") or created.get("workflowId") or "")
+    workflow = _registration.poll_workflow_until_settled(
+        client=client, workflow_id=workflow_id)
+    base.update({
+        "registered": True, "workflow_id": workflow_id,
+        "workflow_status": str(workflow.get("status", "")).upper(),
+    })
+    return base
+
+
 def fetch_run_bundle(*, client: OmicsClient, run_id: str) -> dict[str, Any]:
     """Everything one run report needs, in as few calls as possible.
 
@@ -409,6 +612,7 @@ def map_run_report(
     start_run_request: dict[str, Any] | None = None,
     submitted: bool = False,
     demo: bool = False,
+    verification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Turn API payloads into this skill's own reported shape."""
     run = bundle.get("run") or {}
@@ -426,6 +630,7 @@ def map_run_report(
         "workflow": workflow,
         "tasks": tasks,
         "tags": dict(bundle.get("tags") or {}),
+        "verification": verification,
         "n_tasks": len(tasks),
         "n_completed": len(completed),
         "n_failed": len(failed),
@@ -446,10 +651,189 @@ def map_list_report(
         "transport": "boto3",
         "items": items,
         "n_items": len(items),
-        "run": {}, "workflow": {}, "tasks": [], "tags": {}, "run_status": "N/A",
+        "run": {}, "workflow": {}, "tasks": [], "tags": {}, "verification": None,
+        "run_status": "N/A",
         "n_tasks": 0, "n_completed": 0, "n_failed": 0,
         "submitted": False, "start_run_request": None, "demo": demo,
     }
+
+
+def _transfer_markdown(data: dict[str, Any]) -> str:
+    """Report for the modes that move bytes or create a workflow."""
+    mode = data["mode"]
+    titles = {
+        "upload": "AWS HealthOmics — Input Upload",
+        "download": "AWS HealthOmics — Output Download",
+        "register": "AWS HealthOmics — Workflow Registration",
+    }
+    acted = {"upload": data.get("uploaded"), "download": data.get("downloaded"),
+             "register": data.get("registered")}[mode]
+    header = generate_report_header(
+        title=titles[mode],
+        skill_name=SKILL_NAME,
+        skill_version=SKILL_VERSION,
+        extra_metadata={
+            "Mode": f"{mode.title()}" + ("" if acted else " — DRY RUN"),
+            "Region": data["region"],
+        },
+    )
+    lines = [header, ""]
+
+    if mode == "upload":
+        lines += ["## Upload", ""]
+        lines.append(f"**Destination**: `{data['destination']}`")
+        if acted:
+            lines.append(
+                f"\n{data['n_uploaded']} file(s), {data['n_bytes']:,} bytes uploaded."
+            )
+            lines += ["", "| Source | S3 URI | Bytes |", "|---|---|---|"]
+            for entry in data.get("uploaded_files", []):
+                lines.append(
+                    f"| `{entry['source']}` | `{entry['uri']}` | {entry['n_bytes']:,} |"
+                )
+            lines.append(
+                "\nPass these URIs to `--start-run --params`; this skill does not "
+                "write them into a params file for you."
+            )
+        else:
+            lines.append("\n**Nothing was uploaded.** Files that would be sent:")
+            lines += [""] + [f"- `{p}`" for p in data.get("sources", [])]
+            lines.append("\nRe-run with `--confirm-upload` to transfer.")
+
+    elif mode == "download":
+        lines += ["## Download", ""]
+        lines.append(f"**Source**: `{data['source']}`")
+        if acted:
+            lines.append(
+                f"\n{data['n_downloaded']} of {data['n_objects']} object(s) written "
+                f"to `{data['destination']}`."
+            )
+            if data.get("failures"):
+                lines += ["", "### Failed", ""]
+                for failure in data["failures"]:
+                    lines.append(f"- `{failure['key']}` — {failure['error']}")
+        else:
+            lines.append(
+                f"\n**Nothing was downloaded.** {data['n_objects']} object(s), "
+                f"{data['n_bytes']:,} bytes are available. Re-run with "
+                f"`--confirm-download` to transfer — S3 egress is billable."
+            )
+
+    else:  # register
+        zip_manifest = data.get("zip") or {}
+        lines += ["## Workflow definition", ""]
+        lines.append(f"- **Name**: `{data['workflow_name']}`")
+        lines.append(f"- **Engine**: {data['engine']}")
+        lines.append(f"- **Definition**: `{data['definition_path']}`")
+        lines.append(
+            f"- **Archive**: {zip_manifest.get('n_bytes', 0):,} bytes, "
+            f"`{str(zip_manifest.get('sha256', ''))[:16]}…` "
+            f"({zip_manifest.get('compression', 'stored')})"
+        )
+        lines += ["", "| Archive member | Bytes | sha256 |", "|---|---|---|"]
+        for member in zip_manifest.get("members", []):
+            lines.append(
+                f"| `{member['archive_name']}` | {member['n_bytes']:,} | "
+                f"`{member['sha256'][:12]}…` |"
+            )
+        lines.append(
+            "\nThe archive digest is reproducible: the same inputs always produce "
+            "the same bytes, so it pins exactly what was uploaded."
+        )
+        if acted:
+            status = data.get("workflow_status")
+            lines += ["", f"## Workflow created — status `{status}`", ""]
+            lines.append(f"- **Workflow id**: `{data['workflow_id']}`")
+            if status == "FAILED":
+                lines.append(
+                    "\n**This workflow failed to register and cannot be run.** "
+                    "AWS validates the definition server-side — there is no lint "
+                    "API to catch this earlier — so check that the entrypoint "
+                    "filename matches what the engine expects."
+                )
+            else:
+                lines.append(
+                    f"\nRun it with:\n\n```bash\n--start-run {data['workflow_id']} "
+                    f"--workflow-type PRIVATE --params params.json \\\n"
+                    f"  --output-uri s3://<bucket>/output/ --role-arn <role> \\\n"
+                    f"  --run-name <name> --allow-remote-inputs --confirm-submit\n```"
+                )
+            lines.append(
+                f"\nThis skill cannot delete a workflow — that is barred by "
+                f"consequence, not by omission. Remove it with:\n\n```bash\n"
+                f"aws omics delete-workflow --id {data['workflow_id']} "
+                f"--region {data['region']}\n```"
+            )
+        else:
+            lines += ["", "## Nothing was created.", ""]
+            lines.append(
+                "Re-run with `--confirm-register` to create this workflow. "
+                "Registration bills nothing; running the workflow does."
+            )
+
+    lines += ["", "## Provenance", ""] + _provenance_lines(data)
+    lines += ["", generate_report_footer().strip(), ""]
+    return "\n".join(lines)
+
+
+def _verification_lines(data: dict[str, Any]) -> list[str]:
+    """Render what the run actually produced, without overstating it.
+
+    The ETag distinction is the whole point of this section. For a single-part
+    upload an ETag is the object's MD5; for a multipart upload it is the MD5 of
+    the concatenated part MD5s and hashes nothing recomputable from the file.
+    Genomic outputs are routinely multipart, so calling either one "the
+    checksum" would put a guarantee in the bundle that does not hold.
+    """
+    verification = data.get("verification")
+    if not verification:
+        return []
+
+    deep = verification.get("depth") == "deep"
+    lines = ["", "## Outputs", ""]
+    lines.append(
+        f"{verification['n_objects']} object(s), "
+        f"{verification['n_bytes']:,} bytes under `{verification['source']}`."
+    )
+
+    if deep:
+        if verification.get("complete"):
+            lines.append(
+                f"\nEvery listed object was downloaded to "
+                f"`{verification['downloaded_to']}` and hashed. The SHA-256 values "
+                f"below are real checksums of the bytes on disk."
+            )
+        else:
+            lines.append(
+                f"\n**{verification['n_missing']} listed object(s) could not be "
+                f"retrieved**, so this verification is incomplete: "
+                + ", ".join(f"`{k}`" for k in verification.get("missing", [])[:5])
+            )
+    else:
+        lines.append(
+            "\nListing only — no bytes were transferred. **The ETag column is "
+            "not a checksum**: it equals the object's MD5 only for a single-part "
+            "upload, and for a multipart upload it is the MD5 of the part MD5s "
+            "with a `-N` suffix, which cannot be recomputed from the file. Use "
+            "`--verify-outputs deep` for real SHA-256 checksums."
+        )
+
+    header = "| Key | Bytes | ETag | MD5? |" + (" SHA-256 |" if deep else "")
+    divider = "|---|---|---|---|" + ("---|" if deep else "")
+    lines += ["", header, divider]
+    for entry in verification["objects"][:50]:
+        row = (
+            f"| `{entry['key']}` | {entry['size']:,} | `{entry['etag']}` | "
+            f"{'yes' if entry.get('is_md5') else 'no (multipart)'} |"
+        )
+        if deep:
+            digest = entry.get("sha256")
+            row += f" `{digest[:16]}…`|" if digest else " **missing** |"
+        lines.append(row)
+    if len(verification["objects"]) > 50:
+        lines.append(f"\n…and {len(verification['objects']) - 50} more.")
+
+    return lines
 
 
 def _provenance_lines(data: dict[str, Any]) -> list[str]:
@@ -466,11 +850,36 @@ def _provenance_lines(data: dict[str, Any]) -> list[str]:
             "not a run that took place."
         )
     else:
+        verification = data.get("verification") or {}
+        if verification.get("depth") == "deep" and verification.get("complete"):
+            outputs = (
+                f"Every one of the {verification['n_objects']} output object(s) was "
+                f"downloaded and hashed; the sha256 values in tables/outputs.csv are "
+                f"real checksums of those bytes, computed here rather than reported "
+                f"by AWS."
+            )
+        elif verification.get("depth") == "deep":
+            outputs = (
+                f"Output verification is INCOMPLETE: {verification['n_missing']} of "
+                f"{verification['n_objects']} listed object(s) could not be "
+                f"retrieved, so the checksums below cover only part of the run."
+            )
+        elif verification.get("depth") == "manifest":
+            outputs = (
+                f"The {verification['n_objects']} output object(s) were listed but "
+                f"not fetched, so no checksum in this bundle covers their bytes — an "
+                f"ETag is not one. Use `--verify-outputs deep` for real sha256s."
+            )
+        else:
+            outputs = (
+                "No checksum in this bundle covers the run's outputs, which remain "
+                "in S3 and were not read. Add `--verify-outputs` to record what the "
+                "run produced."
+            )
         ceiling = (
             "This run executed in AWS HealthOmics. Replaying it requires the same "
             "account, execution role and container images. The identifiers here "
-            "pin what the run WAS; no checksum in this bundle covers the run's "
-            "outputs, which remain in S3 — this skill holds no S3 credentials."
+            f"pin what the run WAS. {outputs}"
         )
     return [
         "- Transport: **boto3** (AWS HealthOmics API directly).",
@@ -483,6 +892,8 @@ def _provenance_lines(data: dict[str, Any]) -> list[str]:
 def _report_markdown(data: dict[str, Any]) -> str:
     if data.get("mode") in {"runs", "workflows"}:
         return _list_markdown(data)
+    if data.get("mode") in {"upload", "download", "register"}:
+        return _transfer_markdown(data)
 
     run = data["run"]
     workflow = data["workflow"]
@@ -557,13 +968,17 @@ def _report_markdown(data: dict[str, Any]) -> str:
         prefix = f"{output_uri.rstrip('/')}/{run_id}/" if run_id else output_uri
         lines += [
             "", "## Fetching the outputs", "",
-            "Outputs stay in S3; this skill holds no S3 credentials. Download "
-            "them with `aws-s3-bridge`, or directly:",
+            "Outputs stay in S3. Bring this run's outputs down with:",
             "", "```bash",
+            f"--download-outputs {run_id or '<run-id>'} --to ./run-{run_id or 'outputs'}/ "
+            f"--confirm-download",
+            "```",
+            "", "or with the AWS CLI directly:", "", "```bash",
             f"aws s3 cp --recursive {prefix} ./run-{run_id or 'outputs'}/",
             "```",
         ]
 
+    lines += _verification_lines(data)
     lines += ["", "## Provenance", ""] + _provenance_lines(data)
     lines += ["", generate_report_footer().strip(), ""]
     return "\n".join(lines)
@@ -614,6 +1029,28 @@ def _write_tasks_csv(output_dir: Path, tasks: list[dict[str, Any]]) -> Path:
     return _write_csv(output_dir / "tables" / "tasks.csv", _TASK_FIELDS, tasks)
 
 
+def _pad_transfer_report(data: dict[str, Any], region: str) -> dict[str, Any]:
+    """Fit an upload / download / register result into the shared report shape.
+
+    One ``write_bundle`` handles every mode, so each mode fills the same keys
+    rather than growing a parallel writer per operation.
+    """
+    padded = {
+        "region": region, "transport": "boto3", "demo": False,
+        "run": {}, "workflow": {}, "tasks": [], "tags": {}, "items": [],
+        "n_items": 0, "run_status": "N/A", "n_tasks": 0, "n_completed": 0,
+        "n_failed": 0, "submitted": False, "start_run_request": None,
+        "verification": None,
+    }
+    padded.update(data)
+    return padded
+
+
+_OUTPUT_FIELDS = ("key", "size", "etag", "is_md5", "sha256", "last_modified")
+_UPLOAD_FIELDS = ("source", "key", "uri", "n_bytes")
+_ZIP_MEMBER_FIELDS = ("archive_name", "source_path", "n_bytes", "sha256")
+
+
 def _write_table(output_dir: Path, data: dict[str, Any]) -> Path:
     """Write the table for whatever this report is actually about.
 
@@ -628,6 +1065,22 @@ def _write_table(output_dir: Path, data: dict[str, Any]) -> Path:
     if mode == "workflows":
         return _write_csv(
             output_dir / "tables" / "workflows.csv", _WORKFLOW_FIELDS, data["items"]
+        )
+    if mode == "upload":
+        return _write_csv(output_dir / "tables" / "uploads.csv", _UPLOAD_FIELDS,
+                          data.get("uploaded_files", []))
+    if mode == "download":
+        return _write_csv(output_dir / "tables" / "downloads.csv",
+                          ("key", "path", "etag"), data.get("downloaded_files", []))
+    if mode == "register":
+        return _write_csv(
+            output_dir / "tables" / "definition.csv", _ZIP_MEMBER_FIELDS,
+            (data.get("zip") or {}).get("members", []),
+        )
+    if data.get("verification"):
+        return _write_csv(
+            output_dir / "tables" / "outputs.csv", _OUTPUT_FIELDS,
+            data["verification"]["objects"],
         )
     return _write_tasks_csv(output_dir, data["tasks"])
 
@@ -772,7 +1225,46 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
             )
             return write_bundle(output_dir, data, warn_before_overwrite=False)
 
+    # S3-only modes never construct an omics client: a transfer has nothing to
+    # ask HealthOmics about.
+    if args.upload_inputs:
+        s3 = _s3.S3Operations(_boto=_s3.build_s3_client(args.region, args.profile))
+        data = upload_run_inputs(
+            client=s3, sources=list(args.upload_inputs), destination=args.to,
+            acknowledged=args.allow_remote_inputs, confirmed=args.confirm_upload)
+        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+                            warn_before_overwrite=False)
+
     client = OmicsOperations(_boto=build_boto_client(args.region, args.profile))
+
+    if args.download_outputs:
+        run = client.call("GetRun", id=str(args.download_outputs))
+        output_uri = run.get("outputUri")
+        if not output_uri:
+            raise OmicsCallError(
+                f"Run {args.download_outputs} reports no outputUri, so there is "
+                f"nothing to download."
+            )
+        s3 = _s3.S3Operations(_boto=_s3.build_s3_client(args.region, args.profile))
+        data = download_run_outputs(
+            client=s3, output_uri=output_uri, run_id=str(args.download_outputs),
+            destination=Path(args.to), confirmed=args.confirm_download)
+        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+                            warn_before_overwrite=False)
+
+    if args.register:
+        template = (
+            json.loads(args.parameter_template.read_text(encoding="utf-8"))
+            if args.parameter_template else None
+        )
+        data = register_run_workflow(
+            client=client, definition=Path(args.register),
+            additional_files=list(args.additional_files), name=args.workflow_name,
+            engine=args.engine, description=args.description,
+            parameter_template=template, allow_duplicate=args.allow_duplicate_name,
+            confirmed=args.confirm_register, output_dir=output_dir)
+        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+                            warn_before_overwrite=False)
 
     if args.list_runs:
         items = list_all(client=client, operation="ListRuns", limit=args.limit)
@@ -807,9 +1299,26 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
         )
 
     bundle = fetch_run_bundle(client=client, run_id=run_id)
+
+    verification = None
+    if args.verify_outputs:
+        output_uri = (bundle.get("run") or {}).get("outputUri")
+        if output_uri:
+            s3 = _s3.S3Operations(_boto=_s3.build_s3_client(args.region, args.profile))
+            verification = verify_run_outputs(
+                client=s3, output_uri=output_uri, run_id=run_id,
+                depth=args.verify_outputs,
+                destination=Path(args.to) if args.to else None,
+                confirmed=args.confirm_download)
+        else:
+            print(
+                f"WARNING: run {run_id} reports no outputUri; nothing to verify.",
+                file=sys.stderr,
+            )
+
     data = map_run_report(
         bundle, region=args.region, start_run_request=start_run_request,
-        submitted=bool(args.start_run),
+        submitted=bool(args.start_run), verification=verification,
     )
     return write_bundle(output_dir, data, warn_before_overwrite=False)
 
@@ -832,6 +1341,13 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--list-workflows", action="store_true", help="List workflows (read-only)")
     mode.add_argument("--run-status", metavar="RUN_ID", help="Report one run (read-only)")
     mode.add_argument("--start-run", metavar="WORKFLOW_ID", help="Submit a run (gated)")
+    mode.add_argument("--upload-inputs", nargs="+", type=Path, metavar="PATH",
+                      help="Upload a run's input files to S3 (gated)")
+    mode.add_argument("--download-outputs", metavar="RUN_ID",
+                      help="Download one run's outputs from S3 (gated)")
+    mode.add_argument("--register", metavar="DEFINITION",
+                      help="Register a WDL/CWL/Nextflow definition as a private "
+                           "workflow (gated). Dry-run without --confirm-register.")
 
     parser.add_argument(
         "--workflow-type", choices=["PRIVATE", "READY2RUN"],
@@ -845,6 +1361,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-uri", help="S3 URI for run outputs (with --start-run)")
     parser.add_argument("--role-arn", help="HealthOmics execution role ARN (with --start-run)")
     parser.add_argument("--run-name", help="Run name (with --start-run)")
+    parser.add_argument("--to", help="Destination: an s3:// URI for --upload-inputs, "
+                                     "a local directory for --download-outputs")
+    parser.add_argument("--confirm-upload", action="store_true",
+                        help="Actually upload. Without it --upload-inputs is a dry run.")
+    parser.add_argument("--confirm-download", action="store_true",
+                        help="Actually download. S3 egress is billable.")
+    parser.add_argument(
+        "--verify-outputs", nargs="?", const="manifest", default=None,
+        choices=["manifest", "deep"],
+        help="With --run-status: record what the run produced. 'manifest' lists "
+             "sizes and ETags and moves no bytes; 'deep' downloads and computes "
+             "real SHA-256 checksums (needs --confirm-download).",
+    )
+    parser.add_argument("--workflow-name", help="Name for the new workflow (with --register)")
+    parser.add_argument("--engine", choices=sorted(_registration.SUPPORTED_ENGINES),
+                        help="Workflow engine. Inferred from the definition's "
+                             "extension (.wdl/.cwl/.nf) when omitted.")
+    parser.add_argument("--additional-files", nargs="+", type=Path, default=[],
+                        help="Extra files for a multi-file WDL/CWL bundle")
+    parser.add_argument("--description", help="Workflow description (with --register)")
+    parser.add_argument("--parameter-template", type=Path,
+                        help="JSON parameter template (with --register)")
+    parser.add_argument("--allow-duplicate-name", action="store_true",
+                        help="Register even though a workflow of this name exists")
+    parser.add_argument("--confirm-register", action="store_true",
+                        help="Actually create the workflow. Without it --register "
+                             "is a dry run.")
     parser.add_argument("--storage-type", choices=["STATIC", "DYNAMIC"],
                         help="Omit to take AWS's preferred DYNAMIC default")
     parser.add_argument("--storage-capacity", type=int,
@@ -898,10 +1441,59 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result["summary"], indent=2))
         return 0
 
-    if not any([args.list_runs, args.list_workflows, args.run_status, args.start_run]):
+    if not any([args.list_runs, args.list_workflows, args.run_status, args.start_run,
+                args.upload_inputs, args.download_outputs, args.register]):
         parser.error(
-            "choose one of --demo, --list-runs, --list-workflows, --run-status or --start-run"
+            "choose one of --demo, --list-runs, --list-workflows, --run-status, "
+            "--start-run, --upload-inputs, --download-outputs or --register"
         )
+
+    # Mode-scoped flags rejected outside their mode, so a misplaced flag is a
+    # loud error rather than a silently ignored one.
+    for flag, value, owner in (
+        ("--workflow-name", args.workflow_name, "--register"),
+        ("--engine", args.engine, "--register"),
+        ("--additional-files", args.additional_files, "--register"),
+        ("--description", args.description, "--register"),
+        ("--parameter-template", args.parameter_template, "--register"),
+        ("--allow-duplicate-name", args.allow_duplicate_name, "--register"),
+        ("--confirm-register", args.confirm_register, "--register"),
+        ("--confirm-upload", args.confirm_upload, "--upload-inputs"),
+    ):
+        owned = {"--register": args.register, "--upload-inputs": args.upload_inputs}[owner]
+        if value and not owned:
+            parser.error(f"{flag} only applies to {owner}")
+
+    if args.upload_inputs:
+        if not args.to:
+            parser.error("--upload-inputs requires --to s3://bucket/prefix/")
+        missing_sources = [str(p) for p in args.upload_inputs if not p.expanduser().is_file()]
+        if missing_sources:
+            parser.error(f"input file not found: {', '.join(missing_sources)}")
+
+    if args.download_outputs and not args.to:
+        parser.error("--download-outputs requires --to <local-directory>")
+
+    if args.verify_outputs and not args.run_status:
+        parser.error("--verify-outputs only applies to --run-status")
+
+    if args.verify_outputs == "deep" and not args.confirm_download:
+        parser.error(
+            "--verify-outputs deep downloads every output to hash it, and S3 "
+            "egress is billable. Add --confirm-download, or use "
+            "--verify-outputs manifest which moves no bytes."
+        )
+
+    if args.register:
+        if not args.workflow_name:
+            parser.error("--register requires --workflow-name")
+        if not Path(args.register).expanduser().is_file():
+            parser.error(f"definition not found: {args.register}")
+        for extra in args.additional_files:
+            if not extra.expanduser().is_file():
+                parser.error(f"additional file not found: {extra}")
+        if args.parameter_template and not args.parameter_template.expanduser().is_file():
+            parser.error(f"parameter template not found: {args.parameter_template}")
 
     if args.start_run:
         missing = [

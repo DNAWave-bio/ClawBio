@@ -61,6 +61,7 @@ dependencies = [
 # `uvx --from 'clawbio[mcp]' clawbio mcp` configurations keep working until then.
 # Pinned below 2.0: mcp 2.0.0 removed mcp.server.fastmcp (now mcp.server.mcpserver).
 mcp = ["mcp>=1.9,<2"]
+healthomics = ["boto3>=1.34"]
 just-prs = [
     "fastmcp>=3.4.4,<4",
     "typer>=0.27,<1",

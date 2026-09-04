@@ -22,12 +22,12 @@ other AWS HealthOmics skill.
 | **Egress gate** (explicit ack before data leaves) | ✅ `--allow-remote-inputs` | ❌ | ❌ | n/a — local-first |
 | **Cost gate** (second confirmation to spend) | ✅ `--confirm-submit` | ❌ | ❌ | n/a |
 | **Cost gate states the cost** | ✅ priced from a dated snapshot | n/a | n/a | n/a |
-| **Operation allowlist** | ✅ 8 of 107 API operations | n/a | n/a | n/a |
+| **Operation allowlist** | ✅ 9 of 107 API operations, + 3 of ~90 S3 methods | n/a | n/a | n/a |
 | **Errors** | botocore raises | raises | raises | raises |
 | **`--demo` fully offline** | ✅ | ✅ | ❌ (live API call) | ✅ |
 | **Live tests vs. real service** | ✅ 7, 2 need no network | ❌ | ❌ | ❌ |
-| **Tests** | 53 (46 offline + 7 live) | 51 | 25 | 26 |
-| **Python LOC** | 1,169 | 1,913 | 1,540 | 1,303 |
+| **Tests** | 110 (103 offline + 7 live) | 51 | 25 | 26 |
+| **Python LOC** | 1,795 | 1,913 | 1,540 | 1,303 |
 
 **The gate columns are the real story.** `healthomics-bridge` is the only one
 of these four that (a) can spend real money and (b) makes both consequences —
@@ -42,27 +42,32 @@ HealthOmics needed the stronger contract and got one.
 
 | | **healthomics-bridge** | **galaxy-bridge** | **flow-bio** | **illumina-bridge** |
 |---|---|---|---|---|
-| **Pattern** | reference passing | proxy relay | proxy relay | local-only |
-| **Where inputs live** | already in S3 | local disk | local disk | local disk |
-| **Data through the skill's own process** | **never** | yes — `bioblend` upload | yes — chunked upload | read-only, in place |
-| **Holds storage credentials** | **no** | yes (API key) | yes (JWT) | no |
-| **Uploads sample data** | no — AWS does the I/O | **yes** | **yes** | no |
-| **Downloads results** | no — outputs stay in S3 | **yes** | no (metadata only) | n/a |
-| **Can verify its own outputs** | **no — the report says so** | yes (downloaded) | partial | yes (local) |
+| **Pattern** | reference passing + gated run I/O | proxy relay | proxy relay | local-only |
+| **Where inputs live** | local disk → S3, or already in S3 | local disk | local disk | local disk |
+| **Data through the skill's own process** | yes — a run's own inputs and outputs | yes — `bioblend` upload | yes — chunked upload | read-only, in place |
+| **Holds storage credentials** | yes — S3, scoped to a run's prefixes | yes (API key) | yes (JWT) | no |
+| **Uploads sample data** | **yes** — `--upload-inputs`, double-gated | **yes** | **yes** | no |
+| **Downloads results** | **yes** — `--download-outputs`, gated | **yes** | no (metadata only) | n/a |
+| **Can verify its own outputs** | **yes** — ETag manifest, or real SHA-256 with `--verify-outputs deep` | yes (downloaded) | partial | yes (local) |
 
-`healthomics-bridge` never touches genomic bytes directly — it hands AWS a
-URI and AWS does the I/O. That's *why* the run report is explicit about not
-being able to checksum outputs: they never passed through this process, so
-there is nothing here to hash. `galaxy-bridge` and `flow-bio` take the
-opposite shape — the skill process is the pipe the bytes flow through — which
-is why each of those needs different credentials (upload-capable) and a
-different honesty story (they *can* verify what they moved, having moved it).
+`healthomics-bridge` used to hand AWS a URI and touch no bytes at all, which
+is why its report once stated it could not checksum outputs. That changed when
+run I/O was added, and for a reason worth naming: **HealthOmics exposes zero
+output-listing operations**, so "what did this run produce?" is unanswerable
+without S3. The skill now moves a run's own inputs and outputs and can hash
+them — but only within that run's prefixes, and it still creates no buckets,
+sets no policies and deletes nothing.
+
+The distinction that survives is *scope*, not abstinence. `galaxy-bridge` and
+`flow-bio` are pipes for whatever you hand them; this skill's storage access is
+bounded by one run's input and output paths, which is what keeps a
+credential-holding skill honest about its blast radius.
 
 ## This skill's own flow
 
 ```mermaid
 flowchart TD
-    CLI["CLI — 5 modes"] --> MODE{mode?}
+    CLI["CLI — 8 modes"] --> MODE{mode?}
     MODE -->|--demo| FIX["replay JSON fixture<br/>no boto3, no creds, no network"]
     MODE -->|read-only| PAGE["list_all — pages nextToken<br/>AWS caps maxResults at 100"]
     MODE -->|--start-run| G1{"--allow-remote-inputs?"}
@@ -72,7 +77,7 @@ flowchart TD
     G2 -->|no| STOP["estimate only<br/>client never constructed<br/>bills nothing"]
     G2 -->|yes| CALL
     PAGE --> CALL["OmicsOperations.call"]
-    CALL --> AL{"op in ALLOWED_OPERATIONS?<br/>8 of 107"}
+    CALL --> AL{"op in ALLOWED_OPERATIONS?<br/>9 of 107"}
     AL -->|no| R3["OperationNotAllowed<br/>never reaches AWS"]
     AL -->|yes| BOTO["boto3 omics client<br/>adaptive retries, 10 attempts"]
     BOTO --> AWS["AWS HealthOmics API"]
@@ -118,5 +123,10 @@ run, not to its own tests:
   role could not read. Failed before billing, as an exception — not as data.
 - **Two real failures, both diagnosed through this skill's own report**: a
   container built for the wrong CPU architecture, and a missing ECR
-  repository policy. Both are now documented in `SKILL.md`'s Gotchas with the
+  repository policy. Both are documented in [GOTCHAS.md](GOTCHAS.md) with the
   exact fix.
+- **The full loop, live, through this skill alone**: local file uploaded to S3,
+  WDL registered as a private workflow (`ACTIVE`), run submitted and watched to
+  `COMPLETED`, outputs downloaded and hashed. An independent `shasum -a 256`
+  matched the SHA-256 the skill reported, and the downloaded file held the
+  exact string passed in as a parameter. No AWS CLI call in any step.

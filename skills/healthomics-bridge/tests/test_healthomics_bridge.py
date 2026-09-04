@@ -61,7 +61,8 @@ def test_destructive_operations_are_refused(operation):
 def test_allowlist_covers_only_what_this_skill_uses():
     assert ALLOWED_OPERATIONS == {
         "ListRuns", "GetRun", "ListRunTasks", "GetRunTask",
-        "ListWorkflows", "GetWorkflow", "ListTagsForResource", "StartRun",
+        "ListWorkflows", "GetWorkflow", "ListTagsForResource",
+        "CreateWorkflow", "StartRun",
     }
     assert not any(op.startswith(("Delete", "Cancel", "Update")) for op in ALLOWED_OPERATIONS)
 
@@ -101,11 +102,15 @@ def test_run_listing_tabulates_runs_not_tasks(tmp_path):
 
 def test_every_allow_listed_operation_is_actually_reachable():
     """An allowlist entry no code path can invoke is not a permission, it is a
-    lie about the skill's blast radius. The first draft of this skill allow-listed
+    lie about the skill's blast radius. An early draft allow-listed
     ``CreateWorkflow`` with no ``--register`` mode to reach it, and a comment
-    claiming a ``--confirm-register`` gate that did not exist. This test makes
-    the allowlist and the CLI describe the same skill."""
-    source = (SKILL_DIR / "healthomics_bridge.py").read_text(encoding="utf-8")
+    claiming a ``--confirm-register`` gate that did not exist; the mode exists
+    now, and this test is what keeps the allowlist and the CLI describing the
+    same skill."""
+    source = (
+        (SKILL_DIR / "healthomics_bridge.py").read_text(encoding="utf-8")
+        + (SKILL_DIR / "registration.py").read_text(encoding="utf-8")
+    )
     for operation in ALLOWED_OPERATIONS:
         assert f'"{operation}"' in source, (
             f"{operation} is allow-listed but no code path calls it — either wire "
@@ -575,3 +580,245 @@ def test_skill_md_declares_the_egress_and_cost_gates():
     content = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
     assert "--allow-remote-inputs" in content
     assert "--confirm-submit" in content
+
+
+# ---------------------------------------------------------------------------
+# Closing the loop: data in, data out, and verifying what came back
+# ---------------------------------------------------------------------------
+
+
+class FakeS3Ops:
+    """Recording stand-in for the allow-listed S3 client."""
+
+    def __init__(self, **responses: Any) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def call(self, method: str, **kwargs: Any) -> Any:
+        self.calls.append((method, kwargs))
+        if method not in self.responses:
+            raise AssertionError(f"Unexpected S3 method: {method}")
+        value = self.responses[method]
+        return value(**kwargs) if callable(value) else value
+
+
+def test_upload_refuses_without_the_egress_acknowledgement(tmp_path):
+    """Uploading puts a genome somewhere it was not before. Same fail-closed
+    contract as --start-run, and for the same reason."""
+    src = tmp_path / "reads.fastq"; src.write_text("@r\nACGT\n+\n!!!!\n")
+    s3 = FakeS3Ops(upload_file=None)
+
+    with pytest.raises(bridge.EgressRefused):
+        bridge.upload_run_inputs(
+            client=s3, sources=[src], destination="s3://bucket/in/",
+            acknowledged=False, confirmed=True)
+    assert s3.calls == [], "nothing may reach S3 before the gate passes"
+
+
+def test_upload_without_confirmation_transfers_nothing(tmp_path):
+    src = tmp_path / "reads.fastq"; src.write_text("x")
+    s3 = FakeS3Ops(upload_file=None)
+
+    result = bridge.upload_run_inputs(
+        client=s3, sources=[src], destination="s3://bucket/in/",
+        acknowledged=True, confirmed=False)
+
+    assert result["uploaded"] is False
+    assert s3.calls == [], "an unconfirmed upload is a dry run"
+
+
+def test_a_confirmed_upload_transfers_and_reports_the_uris(tmp_path):
+    src = tmp_path / "reads.fastq"; src.write_text("x")
+    s3 = FakeS3Ops(upload_file=None)
+
+    result = bridge.upload_run_inputs(
+        client=s3, sources=[src], destination="s3://bucket/in/",
+        acknowledged=True, confirmed=True)
+
+    assert result["uploaded"] is True
+    assert result["uris"] == ["s3://bucket/in/reads.fastq"]
+    assert [c[0] for c in s3.calls] == ["upload_file"]
+    # The per-file detail must survive alongside the boolean status. An earlier
+    # draft used "uploaded" for both and the boolean silently clobbered the
+    # list, emptying the uploads table while every assertion above still passed.
+    assert [f["key"] for f in result["uploaded_files"]] == ["in/reads.fastq"]
+
+
+def test_download_needs_no_egress_gate_only_confirmation(tmp_path):
+    """Downloading brings data TO the machine. Gating both directions makes the
+    flag reflexive, and a flag passed on every command stops carrying meaning
+    on the one command where it matters."""
+    objects = [{"key": "out/7/a.txt", "size": 1, "etag": "e"}]
+    s3 = FakeS3Ops(
+        list_objects_v2={"Contents": [{"Key": "out/7/a.txt", "Size": 1, "ETag": '"e"'}]},
+        download_file=lambda Bucket, Key, Filename: Path(Filename).write_text("d"),
+    )
+
+    dry = bridge.download_run_outputs(
+        client=s3, output_uri="s3://bucket/out/", run_id="7",
+        destination=tmp_path, confirmed=False)
+    assert dry["downloaded"] is False
+
+    wet = bridge.download_run_outputs(
+        client=s3, output_uri="s3://bucket/out/", run_id="7",
+        destination=tmp_path, confirmed=True)
+    assert wet["downloaded"] is True
+    assert wet["n_downloaded"] == 1
+    assert objects  # layout asserted in test_s3_client
+
+
+def test_download_targets_only_this_runs_prefix():
+    """<outputUri>/<runId>/ -- pointing at outputUri alone pulls every run the
+    account ever wrote."""
+    s3 = FakeS3Ops(list_objects_v2={"Contents": []})
+    bridge.download_run_outputs(
+        client=s3, output_uri="s3://bucket/out/", run_id="7049640",
+        destination=Path("/tmp/x"), confirmed=False)
+    assert s3.calls[0][1]["Prefix"] == "out/7049640/"
+
+
+def test_manifest_verification_records_etags_without_downloading(tmp_path):
+    """Cheap by design: a listing, no egress, no bytes moved."""
+    s3 = FakeS3Ops(list_objects_v2={"Contents": [
+        {"Key": "out/7/a.txt", "Size": 10, "ETag": '"abc"'},
+        {"Key": "out/7/b.bam", "Size": 99, "ETag": '"def-4"'},
+    ]})
+
+    result = bridge.verify_run_outputs(
+        client=s3, output_uri="s3://bucket/out/", run_id="7",
+        depth="manifest", destination=None, confirmed=False)
+
+    assert result["depth"] == "manifest"
+    assert result["n_objects"] == 2
+    assert "download_file" not in [c[0] for c in s3.calls]
+    multi = next(o for o in result["objects"] if o["key"].endswith(".bam"))
+    assert multi["is_md5"] is False, "a -N ETag is not an md5 of the object"
+
+
+def test_a_manifest_never_calls_an_etag_a_checksum(tmp_path):
+    """The repro bundle must not carry a guarantee that does not hold."""
+    s3 = FakeS3Ops(list_objects_v2={"Contents": [
+        {"Key": "out/7/b.bam", "Size": 99, "ETag": '"def-4"'}]})
+    data = bridge.map_run_report(
+        {"run": {"id": "7", "status": "COMPLETED", "outputUri": "s3://bucket/out/"},
+         "workflow": {}, "tasks": [], "tags": {}},
+        region="us-east-1",
+        verification=bridge.verify_run_outputs(
+            client=s3, output_uri="s3://bucket/out/", run_id="7",
+            depth="manifest", destination=None, confirmed=False),
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+
+    assert "ETag" in report
+    assert "not a checksum" in report.lower() or "not an md5" in report.lower()
+
+
+def test_deep_verification_hashes_what_it_downloaded(tmp_path):
+    def _download(Bucket, Key, Filename):  # noqa: N803
+        Path(Filename).parent.mkdir(parents=True, exist_ok=True)
+        Path(Filename).write_text("payload")
+
+    s3 = FakeS3Ops(
+        list_objects_v2={"Contents": [{"Key": "out/7/a.txt", "Size": 7, "ETag": '"e"'}]},
+        download_file=_download,
+    )
+    result = bridge.verify_run_outputs(
+        client=s3, output_uri="s3://bucket/out/", run_id="7",
+        depth="deep", destination=tmp_path, confirmed=True)
+
+    assert result["depth"] == "deep"
+    assert result["objects"][0]["sha256"], "deep mode must produce a real hash"
+    assert result["n_missing"] == 0
+
+
+def test_deep_verification_reports_an_output_that_never_landed(tmp_path):
+    """write_checksums silently skips missing files, so it cannot detect a
+    missing output on its own. This comparison is the point of deep mode."""
+    def _download(Bucket, Key, Filename):  # noqa: N803
+        raise RuntimeError("NoSuchKey")
+
+    s3 = FakeS3Ops(
+        list_objects_v2={"Contents": [{"Key": "out/7/a.txt", "Size": 7, "ETag": '"e"'}]},
+        download_file=_download,
+    )
+    result = bridge.verify_run_outputs(
+        client=s3, output_uri="s3://bucket/out/", run_id="7",
+        depth="deep", destination=tmp_path, confirmed=True)
+
+    assert result["n_missing"] == 1
+    assert result["complete"] is False
+
+
+def test_deep_verification_refuses_without_download_confirmation(tmp_path):
+    """Deep mode downloads every output; that is real egress and real money."""
+    s3 = FakeS3Ops(list_objects_v2={"Contents": []})
+    with pytest.raises(SystemExit):
+        bridge.main(["--run-status", "7", "--verify-outputs", "deep",
+                     "--output", str(tmp_path)])
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+
+def test_register_without_confirmation_creates_nothing(tmp_path):
+    wdl = tmp_path / "main.wdl"; wdl.write_text("version 1.0\nworkflow W {}\n")
+    client = FakeOmics(ListWorkflows={"items": []})
+
+    result = bridge.register_run_workflow(
+        client=client, definition=wdl, additional_files=[], name="my-wf",
+        engine=None, description=None, parameter_template=None,
+        allow_duplicate=False, confirmed=False, output_dir=tmp_path)
+
+    assert result["registered"] is False
+    assert "CreateWorkflow" not in [op for op, _ in client.calls]
+    assert result["zip"]["sha256"], "the archive is built and pinned even on a dry run"
+
+
+def test_register_requires_a_workflow_name(tmp_path):
+    wdl = tmp_path / "main.wdl"; wdl.write_text("version 1.0\n")
+    with pytest.raises(SystemExit):
+        bridge.main(["--register", str(wdl), "--output", str(tmp_path)])
+
+
+def test_register_only_flags_are_rejected_outside_register_mode(tmp_path):
+    with pytest.raises(SystemExit):
+        bridge.main(["--list-runs", "--workflow-name", "x", "--output", str(tmp_path)])
+
+
+def test_provenance_stops_claiming_outputs_are_unchecked_once_they_are(tmp_path):
+    """The ceiling has to track what actually happened. Asserting 'no checksum
+    covers the outputs' under a deep verification that just hashed every one of
+    them would be false in the direction that flatters the skill."""
+    verified = {
+        "depth": "deep", "source": "s3://b/out/7/", "n_objects": 1,
+        "n_bytes": 7, "n_missing": 0, "complete": True,
+        "downloaded_to": str(tmp_path / "dl"),
+        "objects": [{"key": "out/7/a.txt", "size": 7, "etag": "e", "is_md5": True,
+                     "sha256": "a" * 64}],
+    }
+    data = bridge.map_run_report(
+        {"run": {"id": "7", "status": "COMPLETED", "outputUri": "s3://b/out/"},
+         "workflow": {}, "tasks": [], "tags": {}},
+        region="us-east-1", verification=verified,
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+
+    assert "holds no S3 credentials" not in report
+    assert "no checksum in this bundle covers" not in report
+    assert "sha256" in report.lower()
+
+
+def test_provenance_still_admits_unchecked_outputs_when_they_are(tmp_path):
+    data = bridge.map_run_report(
+        {"run": {"id": "7", "status": "COMPLETED", "outputUri": "s3://b/out/"},
+         "workflow": {}, "tasks": [], "tags": {}},
+        region="us-east-1", verification=None,
+    )
+    bridge.write_bundle(tmp_path, data, warn_before_overwrite=False)
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+
+    assert "--verify-outputs" in report, "and it must say how to change that"
