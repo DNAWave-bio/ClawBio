@@ -228,27 +228,48 @@ derived, not supplied.
 ## Example Queries
 
 - "Submit the ESMFold Ready2Run workflow against these inputs."
-- "What happened to run 7654321?"
+- "What happened to run 7049640?"
 
 ## Example Output
+
+Captured verbatim from `--run-status` against a real, completed Ready2Run
+submission — not written by hand. This is the same run cited in Validation
+Evidence below.
 
 ```markdown
 # AWS HealthOmics Run Report
 
-**Mode**: Live AWS HealthOmics (boto3) | **Region**: us-east-1 | **Run status**: COMPLETED
+**Mode**: Live AWS HealthOmics (boto3)
+**Region**: us-east-1
+**Run status**: COMPLETED
 
 ## Run
 
-- **Run id**: `7654321`
-- **Workflow**: `clawbio-demo-rnaseq` (`1234567`, PRIVATE)
+- **Run id**: `7049640`
+- **Run name**: clawbio-boto3-r2r-verify
+- **Status**: **COMPLETED**
+- **Workflow**: `ESMFold for up to 800 residues` (`1830181`, READY2RUN)
+- **Output URI**: `s3://my-bucket/output/`
+- **Tags**: `purpose=boto3-live-verification`, `skill=healthomics-bridge`
 
 ## Tasks
 
-3 task(s): 2 completed, 1 failed.
+2 task(s): 2 completed, 0 failed.
 
-### Failed tasks
+## Fetching the outputs
 
-- **NFCORE_RNASEQ:SALMON_QUANT** (`task-0003`) — FAILED
+Outputs stay in S3; this skill holds no S3 credentials. Download them with
+`aws-s3-bridge`, or directly:
+
+    aws s3 cp --recursive s3://my-bucket/output/7049640/ ./run-7049640/
+
+## Provenance
+
+- Transport: **boto3** (AWS HealthOmics API directly).
+- Allow-listed operations: 8 of 107 available.
+
+This run executed in AWS HealthOmics. Replaying it requires the same account,
+execution role and container images.
 ```
 
 ## Output Structure
@@ -445,6 +466,7 @@ claim a run succeeded when `summary.run_status` says otherwise.
 - [AWS HealthOmics](https://aws.amazon.com/healthomics/) — the service this skill drives.
 - [boto3 omics client](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/omics.html) — the transport.
 - [Run storage types](https://docs.aws.amazon.com/omics/latest/dev/workflows-run-types.html) — source for the STATIC capacity rounding rule.
+- [COMPARISON.md](COMPARISON.md) — measured comparison against ClawBio's other platform-bridge skills.
 
 ---
 
