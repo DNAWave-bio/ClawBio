@@ -257,8 +257,9 @@ derived, not supplied.
 ## Example Output
 
 Captured verbatim from `--run-status` against a real, completed Ready2Run
-submission — not written by hand. This is the same run cited in Validation
-Evidence below.
+submission — not written by hand. [EXAMPLE.md](EXAMPLE.md) walks the whole loop
+(upload → register → submit → verify → download) with real output from each
+step.
 
 ```markdown
 # AWS HealthOmics Run Report

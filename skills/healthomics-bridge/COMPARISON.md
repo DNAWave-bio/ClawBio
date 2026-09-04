@@ -22,12 +22,14 @@ other AWS HealthOmics skill.
 | **Egress gate** (explicit ack before data leaves) | ✅ `--allow-remote-inputs` | ❌ | ❌ | n/a — local-first |
 | **Cost gate** (second confirmation to spend) | ✅ `--confirm-submit` | ❌ | ❌ | n/a |
 | **Cost gate states the cost** | ✅ priced from a dated snapshot | n/a | n/a | n/a |
-| **Operation allowlist** | ✅ 9 of 107 API operations, + 3 of ~90 S3 methods | n/a | n/a | n/a |
+| **Operation allowlist** | ✅ 9 of 107 omics operations, + 3 of 127 S3 client methods | n/a | n/a | n/a |
 | **Errors** | botocore raises | raises | raises | raises |
+| **Registers a workflow definition** | ✅ WDL / CWL / Nextflow, gated | ❌ (runs published tools) | ✅ pipelines are preconfigured | n/a |
+| **Reproducible definition archive** | ✅ byte-identical ZIP, sha256 pinned | n/a | n/a | n/a |
 | **`--demo` fully offline** | ✅ | ✅ | ❌ (live API call) | ✅ |
 | **Live tests vs. real service** | ✅ 7, 2 need no network | ❌ | ❌ | ❌ |
 | **Tests** | 110 (103 offline + 7 live) | 51 | 25 | 26 |
-| **Python LOC** | 1,795 | 1,913 | 1,540 | 1,303 |
+| **Python LOC** | 2,329 | 1,913 | 1,540 | 1,303 |
 
 **The gate columns are the real story.** `healthomics-bridge` is the only one
 of these four that (a) can spend real money and (b) makes both consequences —
@@ -110,7 +112,8 @@ convergence, not the numeric comparison, is the useful data point.
 ## Evidence this table rests on
 
 Every claim about `healthomics-bridge` above traces to a real, live-executed
-run, not to its own tests:
+run, not to its own tests. [EXAMPLE.md](EXAMPLE.md) shows the captured output
+from each step:
 
 - **Ready2Run**: ESMFold submitted with `--start-run --workflow-type
   READY2RUN`, completed, produced a real predicted structure (`pLDDT 74.6`)
